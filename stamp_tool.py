@@ -28,12 +28,13 @@
 
 import os
 import sys
+import shutil
 import threading
 import traceback
 from datetime import datetime
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 try:
     import tkinter as tk
@@ -49,6 +50,16 @@ except ImportError:
         import fitz  # PyMuPDF（舊版相容名稱）
     except ImportError:
         fitz = None
+
+
+def get_font(size):
+    """嘗試找一個可用的字型（時間戳記只有數字/符號，不需要中文字型）"""
+    for name in ("arial.ttf", "Arial.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
 
 
 SUPPORTED_IMG_EXT = {".jpg", ".jpeg", ".png"}
@@ -257,7 +268,7 @@ DEFAULT_MODE = "fixed"
 # ----------------------------------------------------------------------
 def stamp_image_file(input_path, output_path, stamp_rgba,
                       stamp_width_ratio=0.14, position=DEFAULT_POSITION,
-                      mode=DEFAULT_MODE, log=print):
+                      mode=DEFAULT_MODE, add_timestamp=False, log=print):
     img = Image.open(input_path).convert("RGB")
     W, H = img.size
 
@@ -276,6 +287,19 @@ def stamp_image_file(input_path, output_path, stamp_rgba,
 
     img.paste(resized_stamp, (x, y), resized_stamp)
 
+    if add_timestamp:
+        text = datetime.now().strftime("%m/%d %H:%M")
+        font_size = max(14, int(stamp_w * 0.16))
+        font = get_font(font_size)
+        draw = ImageDraw.Draw(img)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        tx = x + (stamp_w - text_w) // 2
+        ty = y + stamp_h + max(2, int(stamp_h * 0.03))
+        tx = max(0, min(tx, W - text_w))
+        ty = min(ty, H - text_h)
+        draw.text((tx, ty), text, fill=(180, 0, 0), font=font)
+
     ext = os.path.splitext(output_path)[1].lower()
     if ext in (".jpg", ".jpeg"):
         img.save(output_path, quality=95)
@@ -290,7 +314,8 @@ def stamp_image_file(input_path, output_path, stamp_rgba,
 # ----------------------------------------------------------------------
 def stamp_pdf_file(input_path, output_path, stamp_rgba,
                     stamp_width_ratio=0.14, position=DEFAULT_POSITION,
-                    mode=DEFAULT_MODE, render_zoom=1.5, log=print):
+                    mode=DEFAULT_MODE, add_timestamp=False,
+                    render_zoom=1.5, log=print):
     if fitz is None:
         raise RuntimeError("尚未安裝 PyMuPDF，請先執行: pip install PyMuPDF")
 
@@ -335,6 +360,18 @@ def stamp_pdf_file(input_path, output_path, stamp_rgba,
     stamp_rgba.save(tmp_stamp_path)
     try:
         page.insert_image(rect, filename=tmp_stamp_path, overlay=True)
+
+        if add_timestamp:
+            text = datetime.now().strftime("%m/%d %H:%M")
+            font_size = max(8, min(14, w_pt * 0.15))
+            text_w = fitz.get_text_length(text, fontname="helv", fontsize=font_size)
+            tx = x_pt + (w_pt - text_w) / 2
+            ty = y_pt + h_pt + font_size * 1.1
+            ty = min(ty, page_rect.height - 2)
+            tx = max(0, min(tx, page_rect.width - text_w))
+            page.insert_text((tx, ty), text, fontname="helv",
+                              fontsize=font_size, color=(0.7, 0, 0))
+
         doc.save(output_path, garbage=4, deflate=True)
     finally:
         doc.close()
@@ -347,12 +384,26 @@ def stamp_pdf_file(input_path, output_path, stamp_rgba,
 # ----------------------------------------------------------------------
 # 批次處理主邏輯
 # ----------------------------------------------------------------------
+def _unique_dest_path(dest_dir, filename):
+    """如果目的地已經有同名檔案，自動加上流水號避免覆蓋掉舊檔案"""
+    base, ext = os.path.splitext(filename)
+    candidate = os.path.join(dest_dir, filename)
+    n = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(dest_dir, f"{base}_{n}{ext}")
+        n += 1
+    return candidate
+
+
 def batch_process(input_dir, stamp_path, output_dir,
                    stamp_width_ratio=0.14, position=DEFAULT_POSITION,
                    mode=DEFAULT_MODE, suffix="已蓋章",
+                   add_timestamp=False, processed_dir=None,
                    log=print, progress_cb=None):
     stamp_rgba = load_stamp_rgba(stamp_path)
     os.makedirs(output_dir, exist_ok=True)
+    if processed_dir:
+        os.makedirs(processed_dir, exist_ok=True)
 
     stamp_abs = os.path.abspath(stamp_path)
     files = sorted(
@@ -363,7 +414,7 @@ def batch_process(input_dir, stamp_path, output_dir,
 
     total = len(files)
     if total == 0:
-        log("找不到任何 PDF / JPG / PNG 檔案。")
+        log("找不到任何 PDF / JPG / PNG 檔案（可能都已經蓋過章、被搬走了）。")
         return 0, 0
 
     ok_count = 0
@@ -380,12 +431,18 @@ def batch_process(input_dir, stamp_path, output_dir,
             if ext.lower() in SUPPORTED_PDF_EXT:
                 stamp_pdf_file(input_path, output_path, stamp_rgba,
                                 stamp_width_ratio, position=position,
-                                mode=mode, log=log)
+                                mode=mode, add_timestamp=add_timestamp, log=log)
             else:
                 stamp_image_file(input_path, output_path, stamp_rgba,
                                   stamp_width_ratio, position=position,
-                                  mode=mode, log=log)
+                                  mode=mode, add_timestamp=add_timestamp, log=log)
             log(f"    ✔ 完成 -> {out_name}")
+
+            if processed_dir:
+                dest = _unique_dest_path(processed_dir, filename)
+                shutil.move(input_path, dest)
+                log(f"    📁 原始檔已搬到: {os.path.basename(dest)}")
+
             ok_count += 1
         except Exception as e:
             log(f"    ✘ 失敗: {e}")
@@ -406,7 +463,7 @@ class StampApp:
     def __init__(self, root):
         self.root = root
         root.title("批次自動蓋章工具")
-        root.geometry("640x640")
+        root.geometry("660x760")
         root.resizable(False, False)
 
         pad = {"padx": 10, "pady": 6}
@@ -425,6 +482,8 @@ class StampApp:
             value=settings.get("suffix_choice", SUFFIX_PRESETS[0]))
         self.suffix_custom = tk.StringVar(
             value=settings.get("suffix_custom", "已蓋章"))
+        self.processed_dir = tk.StringVar(value=settings.get("processed_dir", ""))
+        self.add_timestamp = tk.BooleanVar(value=settings.get("add_timestamp", False))
 
         frm = ttk.Frame(root)
         frm.pack(fill="both", expand=True)
@@ -492,27 +551,43 @@ class StampApp:
         suffix_combo.bind("<<ComboboxSelected>>", lambda e: self._update_suffix_entry_state())
         self._update_suffix_entry_state()
 
+        # 時間戳記設定
+        ts_frm = ttk.Frame(frm)
+        ts_frm.grid(row=10, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0))
+        ttk.Checkbutton(
+            ts_frm, text="⑧ 章的正下方印上時間（格式：月/日 時:分，例如 09/10 14:35）",
+            variable=self.add_timestamp).pack(side="left")
+
+        # 原始檔案搬移設定
+        ttk.Label(frm, text="⑨ 已核章的原始檔搬到（留空則不搬移，原始檔留在原資料夾）：").grid(
+            row=11, column=0, sticky="w", padx=10, pady=(10, 0))
+        ttk.Entry(frm, textvariable=self.processed_dir, width=55).grid(
+            row=12, column=0, sticky="w", padx=10)
+        ttk.Button(frm, text="選擇資料夾", command=self.choose_processed_dir).grid(
+            row=12, column=1, padx=6)
+
         # 說明文字
         note = ("說明：\n"
                 "・PDF 只會蓋在「最後一頁」；圖片檔會蓋在整張圖片上。\n"
                 "・「固定位置」會直接貼齊你選的位置邊緣；「智慧偵測」則會在附近找最空白處，\n"
                 "  但版面複雜（如表格）時可能誤判，效果不理想可改回固定位置。\n"
-                "・原始檔案不會被修改，設定內容下次開啟會自動記住。")
+                "・設定⑨後，蓋完章的原始檔會自動搬過去，下次同一批檔案就不會被重複蓋章。\n"
+                "・原始檔本身內容不會被修改（只是換位置），設定內容下次開啟會自動記住。")
         ttk.Label(frm, text=note, foreground="#555").grid(
-            row=10, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 0))
+            row=13, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 0))
 
         # 開始按鈕
         self.start_btn = ttk.Button(frm, text="開始批次蓋章", command=self.start)
-        self.start_btn.grid(row=11, column=0, columnspan=2, pady=12)
+        self.start_btn.grid(row=14, column=0, columnspan=2, pady=12)
 
         # 進度條
         self.progress = ttk.Progressbar(frm, length=600, mode="determinate")
-        self.progress.grid(row=12, column=0, columnspan=2, padx=10)
+        self.progress.grid(row=15, column=0, columnspan=2, padx=10)
 
         # 紀錄視窗
-        self.log_box = tk.Text(frm, height=10, width=76, state="disabled",
+        self.log_box = tk.Text(frm, height=9, width=76, state="disabled",
                                 bg="#f7f7f7")
-        self.log_box.grid(row=13, column=0, columnspan=2, padx=10, pady=10)
+        self.log_box.grid(row=16, column=0, columnspan=2, padx=10, pady=10)
 
         if fitz is None:
             self.log("⚠ 尚未安裝 PyMuPDF，PDF 功能無法使用。"
@@ -550,6 +625,11 @@ class StampApp:
         if d:
             self.output_dir.set(d)
 
+    def choose_processed_dir(self):
+        d = filedialog.askdirectory(title="選擇已核章原始檔要搬去的資料夾")
+        if d:
+            self.processed_dir.set(d)
+
     # -------- 記錄訊息 --------
     def log(self, msg):
         def _append():
@@ -585,6 +665,15 @@ class StampApp:
             messagebox.showerror("錯誤", "輸出資料夾請不要跟待蓋章資料夾相同，避免混淆原始檔")
             return
 
+        processed_dir = self.processed_dir.get().strip()
+        if processed_dir:
+            if os.path.abspath(processed_dir) == os.path.abspath(input_dir):
+                messagebox.showerror("錯誤", "「原始檔搬移資料夾」請不要跟待蓋章資料夾相同")
+                return
+            if os.path.abspath(processed_dir) == os.path.abspath(output_dir):
+                messagebox.showerror("錯誤", "「原始檔搬移資料夾」請不要跟輸出資料夾相同，避免混淆")
+                return
+
         self.start_btn.configure(state="disabled")
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
@@ -595,6 +684,7 @@ class StampApp:
             self.position_label.get(), DEFAULT_POSITION)
         mode_code = MODE_LABEL_TO_CODE.get(self.mode_label.get(), DEFAULT_MODE)
         suffix = self._resolve_suffix()
+        add_timestamp = self.add_timestamp.get()
 
         # 記住這次的設定，下次開啟自動帶入
         save_settings({
@@ -606,6 +696,8 @@ class StampApp:
             "mode_label": self.mode_label.get(),
             "suffix_choice": self.suffix_choice.get(),
             "suffix_custom": self.suffix_custom.get(),
+            "processed_dir": processed_dir,
+            "add_timestamp": add_timestamp,
         })
 
         def worker():
@@ -616,6 +708,8 @@ class StampApp:
                     position=position_code,
                     mode=mode_code,
                     suffix=suffix,
+                    add_timestamp=add_timestamp,
+                    processed_dir=processed_dir or None,
                     log=self.log,
                     progress_cb=self.set_progress,
                 )
