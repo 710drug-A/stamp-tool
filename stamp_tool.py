@@ -54,6 +54,36 @@ except ImportError:
 SUPPORTED_IMG_EXT = {".jpg", ".jpeg", ".png"}
 SUPPORTED_PDF_EXT = {".pdf"}
 
+# 檔名後綴的常用選項（GUI 下拉選單），選「自訂」時會另外顯示一個輸入框
+SUFFIX_PRESETS = ["組長核章", "主任核章", "自訂"]
+
+# 設定檔：跟執行檔（或程式）放在同一個資料夾，記住上次用過的選項
+if getattr(sys, "frozen", False):
+    _BASE_DIR = os.path.dirname(sys.executable)
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(_BASE_DIR, "stamp_tool_settings.json")
+
+
+def load_settings():
+    """讀取上次儲存的設定，讀不到或格式錯誤就回傳空字典（用預設值）"""
+    try:
+        import json
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(data):
+    """把目前的設定存成 JSON，方便下次開啟時自動帶入"""
+    try:
+        import json
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass  # 存檔失敗也不影響蓋章功能，安靜略過即可
+
 
 # ----------------------------------------------------------------------
 # 章圖片處理：把白色背景去除，變成透明背景的印章
@@ -130,25 +160,104 @@ def find_blank_position(gray_arr, region_box, stamp_w, stamp_h,
     return best_pos[0], best_pos[1], max(best_score, 0.0)
 
 
-def get_search_region(width, height, region_ratio_w=0.35, region_ratio_h=0.28,
+# 支援的蓋章位置代碼，及對應的中文顯示名稱（GUI 下拉選單會用到）
+POSITION_CHOICES = [
+    ("bottom_right", "右下角（預設）"),
+    ("bottom_center", "中央下方"),
+    ("bottom_left", "左下角"),
+    ("top_left", "左上角"),
+    ("top_center", "中央上方"),
+    ("top_right", "右上角"),
+]
+POSITION_LABEL_TO_CODE = {label: code for code, label in POSITION_CHOICES}
+DEFAULT_POSITION = "bottom_right"
+
+
+def get_search_region(width, height, position=DEFAULT_POSITION,
+                       region_ratio_w=0.35, region_ratio_h=0.28,
                        margin_ratio=0.02):
-    """回傳右下角搜尋範圍 (x0, y0, x1, y1)，並留一點邊界，避免蓋到紙張邊緣"""
+    """
+    依照指定的位置代碼，回傳搜尋範圍 (x0, y0, x1, y1)，並留一點邊界避免蓋到
+    紙張邊緣。position 可為：
+        bottom_right / bottom_center / bottom_left /
+        top_right    / top_center    / top_left
+    """
     margin_x = int(width * margin_ratio)
     margin_y = int(height * margin_ratio)
     region_w = int(width * region_ratio_w)
     region_h = int(height * region_ratio_h)
-    x1 = width - margin_x
-    y1 = height - margin_y
-    x0 = max(0, x1 - region_w)
-    y0 = max(0, y1 - region_h)
+    cx = width // 2
+
+    if position not in {c for c, _ in POSITION_CHOICES}:
+        position = DEFAULT_POSITION
+
+    # 先決定垂直方向 (上/下)
+    if position.startswith("bottom"):
+        y1 = height - margin_y
+        y0 = max(0, y1 - region_h)
+    else:  # top_*
+        y0 = margin_y
+        y1 = min(height, y0 + region_h)
+
+    # 再決定水平方向 (左/中/右)
+    if position.endswith("right"):
+        x1 = width - margin_x
+        x0 = max(0, x1 - region_w)
+    elif position.endswith("left"):
+        x0 = margin_x
+        x1 = min(width, x0 + region_w)
+    else:  # *_center
+        x0 = max(0, cx - region_w // 2)
+        x1 = min(width, cx + region_w // 2)
+
     return x0, y0, x1, y1
+
+
+def get_fixed_position(width, height, stamp_w, stamp_h,
+                        position=DEFAULT_POSITION, margin_ratio=0.03):
+    """
+    不做任何空白偵測，直接依照位置代碼算出印章左上角座標（貼齊邊緣 + 一點邊界）。
+    """
+    margin_x = int(width * margin_ratio)
+    margin_y = int(height * margin_ratio)
+    cx = width // 2
+
+    if position not in {c for c, _ in POSITION_CHOICES}:
+        position = DEFAULT_POSITION
+
+    if position.startswith("bottom"):
+        y = height - margin_y - stamp_h
+    else:  # top_*
+        y = margin_y
+
+    if position.endswith("right"):
+        x = width - margin_x - stamp_w
+    elif position.endswith("left"):
+        x = margin_x
+    else:  # *_center
+        x = cx - stamp_w // 2
+
+    x = max(0, min(x, width - stamp_w))
+    y = max(0, min(y, height - stamp_h))
+    return x, y
+
+
+# 蓋章模式：fixed = 直接貼在固定位置（不偵測，速度快、行為可預期）
+#           smart = 在該位置附近的範圍內自動找最空白處（可能誤判表格/文字）
+MODE_CHOICES = [
+    ("fixed", "固定位置（直接貼齊邊緣，不偵測內容）"),
+    ("smart", "智慧偵測（自動找附近最空白處，但可能誤判）"),
+]
+MODE_LABEL_TO_CODE = {label: code for code, label in MODE_CHOICES}
+DEFAULT_MODE = "fixed"
 
 
 # ----------------------------------------------------------------------
 # 處理圖片檔 (jpg / png)
 # ----------------------------------------------------------------------
 def stamp_image_file(input_path, output_path, stamp_rgba,
-                      stamp_width_ratio=0.14, log=print):
+                      stamp_width_ratio=0.14, position=DEFAULT_POSITION,
+                      mode=DEFAULT_MODE, log=print):
     img = Image.open(input_path).convert("RGB")
     W, H = img.size
 
@@ -157,9 +266,13 @@ def stamp_image_file(input_path, output_path, stamp_rgba,
     stamp_h = max(20, int(stamp_rgba.height * ratio))
     resized_stamp = stamp_rgba.resize((stamp_w, stamp_h), Image.LANCZOS)
 
-    gray = np.array(img.convert("L"))
-    region = get_search_region(W, H)
-    x, y, score = find_blank_position(gray, region, stamp_w, stamp_h)
+    if mode == "smart":
+        gray = np.array(img.convert("L"))
+        region = get_search_region(W, H, position=position)
+        x, y, score = find_blank_position(gray, region, stamp_w, stamp_h)
+        log(f"    空白分數: {score:.2f}（越接近 1 代表該處越空白）")
+    else:
+        x, y = get_fixed_position(W, H, stamp_w, stamp_h, position=position)
 
     img.paste(resized_stamp, (x, y), resized_stamp)
 
@@ -169,7 +282,6 @@ def stamp_image_file(input_path, output_path, stamp_rgba,
     else:
         img.save(output_path)
 
-    log(f"    空白分數: {score:.2f}（越接近 1 代表該處越空白）")
     return True
 
 
@@ -177,7 +289,8 @@ def stamp_image_file(input_path, output_path, stamp_rgba,
 # 處理 PDF 檔（只蓋最後一頁）
 # ----------------------------------------------------------------------
 def stamp_pdf_file(input_path, output_path, stamp_rgba,
-                    stamp_width_ratio=0.14, render_zoom=1.5, log=print):
+                    stamp_width_ratio=0.14, position=DEFAULT_POSITION,
+                    mode=DEFAULT_MODE, render_zoom=1.5, log=print):
     if fitz is None:
         raise RuntimeError("尚未安裝 PyMuPDF，請先執行: pip install PyMuPDF")
 
@@ -188,24 +301,32 @@ def stamp_pdf_file(input_path, output_path, stamp_rgba,
     page = doc[-1]  # 最後一頁
     page_rect = page.rect  # 單位: point (1/72 英吋)
 
-    # 為了做空白偵測，先把最後一頁渲染成圖片來分析
-    mat = fitz.Matrix(render_zoom, render_zoom)
-    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
-    gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+    if mode == "smart":
+        # 智慧模式：把最後一頁渲染成圖片來分析空白區域
+        mat = fitz.Matrix(render_zoom, render_zoom)
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+        gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
 
-    stamp_w_px = max(20, int(pix.width * stamp_width_ratio))
-    ratio = stamp_w_px / stamp_rgba.width
-    stamp_h_px = max(20, int(stamp_rgba.height * ratio))
+        stamp_w_px = max(20, int(pix.width * stamp_width_ratio))
+        ratio = stamp_w_px / stamp_rgba.width
+        stamp_h_px = max(20, int(stamp_rgba.height * ratio))
 
-    region = get_search_region(pix.width, pix.height)
-    x_px, y_px, score = find_blank_position(gray, region, stamp_w_px, stamp_h_px)
+        region = get_search_region(pix.width, pix.height, position=position)
+        x_px, y_px, score = find_blank_position(gray, region, stamp_w_px, stamp_h_px)
 
-    # 把像素座標換算回 PDF 的 point 座標
-    scale = 1.0 / render_zoom
-    x_pt = x_px * scale
-    y_pt = y_px * scale
-    w_pt = stamp_w_px * scale
-    h_pt = stamp_h_px * scale
+        scale = 1.0 / render_zoom
+        x_pt = x_px * scale
+        y_pt = y_px * scale
+        w_pt = stamp_w_px * scale
+        h_pt = stamp_h_px * scale
+        log(f"    最後一頁空白分數: {score:.2f}（越接近 1 代表該處越空白）")
+    else:
+        # 固定模式：直接依照頁面尺寸(point)算出貼齊邊緣的座標，不做渲染分析
+        w_pt = page_rect.width * stamp_width_ratio
+        ratio = w_pt / stamp_rgba.width
+        h_pt = stamp_rgba.height * ratio
+        x_pt, y_pt = get_fixed_position(
+            page_rect.width, page_rect.height, w_pt, h_pt, position=position)
 
     rect = fitz.Rect(x_pt, y_pt, x_pt + w_pt, y_pt + h_pt)
 
@@ -220,7 +341,6 @@ def stamp_pdf_file(input_path, output_path, stamp_rgba,
         if os.path.exists(tmp_stamp_path):
             os.remove(tmp_stamp_path)
 
-    log(f"    最後一頁空白分數: {score:.2f}（越接近 1 代表該處越空白）")
     return True
 
 
@@ -228,7 +348,9 @@ def stamp_pdf_file(input_path, output_path, stamp_rgba,
 # 批次處理主邏輯
 # ----------------------------------------------------------------------
 def batch_process(input_dir, stamp_path, output_dir,
-                   stamp_width_ratio=0.14, log=print, progress_cb=None):
+                   stamp_width_ratio=0.14, position=DEFAULT_POSITION,
+                   mode=DEFAULT_MODE, suffix="已蓋章",
+                   log=print, progress_cb=None):
     stamp_rgba = load_stamp_rgba(stamp_path)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -250,17 +372,19 @@ def batch_process(input_dir, stamp_path, output_dir,
     for i, filename in enumerate(files, 1):
         input_path = os.path.join(input_dir, filename)
         name, ext = os.path.splitext(filename)
-        out_name = f"{name}_已蓋章{ext}"
+        out_name = f"{name}_{suffix}{ext}"
         output_path = os.path.join(output_dir, out_name)
 
         log(f"[{i}/{total}] 處理中: {filename}")
         try:
             if ext.lower() in SUPPORTED_PDF_EXT:
                 stamp_pdf_file(input_path, output_path, stamp_rgba,
-                                stamp_width_ratio, log=log)
+                                stamp_width_ratio, position=position,
+                                mode=mode, log=log)
             else:
                 stamp_image_file(input_path, output_path, stamp_rgba,
-                                  stamp_width_ratio, log=log)
+                                  stamp_width_ratio, position=position,
+                                  mode=mode, log=log)
             log(f"    ✔ 完成 -> {out_name}")
             ok_count += 1
         except Exception as e:
@@ -282,15 +406,25 @@ class StampApp:
     def __init__(self, root):
         self.root = root
         root.title("批次自動蓋章工具")
-        root.geometry("640x520")
+        root.geometry("640x640")
         root.resizable(False, False)
 
         pad = {"padx": 10, "pady": 6}
 
-        self.input_dir = tk.StringVar()
-        self.stamp_path = tk.StringVar()
-        self.output_dir = tk.StringVar()
-        self.stamp_width_pct = tk.IntVar(value=14)  # 章寬度佔文件寬度的百分比
+        settings = load_settings()
+
+        self.input_dir = tk.StringVar(value=settings.get("input_dir", ""))
+        self.stamp_path = tk.StringVar(value=settings.get("stamp_path", ""))
+        self.output_dir = tk.StringVar(value=settings.get("output_dir", ""))
+        self.stamp_width_pct = tk.IntVar(value=settings.get("stamp_width_pct", 14))
+        self.position_label = tk.StringVar(
+            value=settings.get("position_label", POSITION_CHOICES[0][1]))
+        self.mode_label = tk.StringVar(
+            value=settings.get("mode_label", MODE_CHOICES[0][1]))
+        self.suffix_choice = tk.StringVar(
+            value=settings.get("suffix_choice", SUFFIX_PRESETS[0]))
+        self.suffix_custom = tk.StringVar(
+            value=settings.get("suffix_custom", "已蓋章"))
 
         frm = ttk.Frame(root)
         frm.pack(fill="both", expand=True)
@@ -326,30 +460,77 @@ class StampApp:
         ttk.Spinbox(size_frm, from_=5, to=40, textvariable=self.stamp_width_pct,
                     width=5).pack(side="left", padx=6)
 
+        # 蓋章位置設定
+        pos_frm = ttk.Frame(frm)
+        pos_frm.grid(row=7, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0))
+        ttk.Label(pos_frm, text="⑤ 蓋章位置（預設右下角，可自行更改）：").pack(side="left")
+        pos_combo = ttk.Combobox(
+            pos_frm, textvariable=self.position_label, state="readonly",
+            width=14, values=[label for _, label in POSITION_CHOICES])
+        pos_combo.pack(side="left", padx=6)
+
+        # 蓋章模式設定
+        mode_frm = ttk.Frame(frm)
+        mode_frm.grid(row=8, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0))
+        ttk.Label(mode_frm, text="⑥ 蓋章方式：").pack(side="left")
+        mode_combo = ttk.Combobox(
+            mode_frm, textvariable=self.mode_label, state="readonly",
+            width=34, values=[label for _, label in MODE_CHOICES])
+        mode_combo.pack(side="left", padx=6)
+
+        # 檔名後綴設定
+        suffix_frm = ttk.Frame(frm)
+        suffix_frm.grid(row=9, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0))
+        ttk.Label(suffix_frm, text="⑦ 檔名後綴（例：文件_組長核章.pdf）：").pack(side="left")
+        suffix_combo = ttk.Combobox(
+            suffix_frm, textvariable=self.suffix_choice, state="readonly",
+            width=10, values=SUFFIX_PRESETS)
+        suffix_combo.pack(side="left", padx=6)
+        self.suffix_entry = ttk.Entry(
+            suffix_frm, textvariable=self.suffix_custom, width=14)
+        self.suffix_entry.pack(side="left", padx=(4, 0))
+        suffix_combo.bind("<<ComboboxSelected>>", lambda e: self._update_suffix_entry_state())
+        self._update_suffix_entry_state()
+
         # 說明文字
         note = ("說明：\n"
                 "・PDF 只會蓋在「最後一頁」；圖片檔會蓋在整張圖片上。\n"
-                "・程式會在右下角範圍內自動尋找最空白的位置蓋章，避免蓋到文字或簽名。\n"
-                "・輸出檔名會加上「_已蓋章」，原始檔案不會被修改。")
+                "・「固定位置」會直接貼齊你選的位置邊緣；「智慧偵測」則會在附近找最空白處，\n"
+                "  但版面複雜（如表格）時可能誤判，效果不理想可改回固定位置。\n"
+                "・原始檔案不會被修改，設定內容下次開啟會自動記住。")
         ttk.Label(frm, text=note, foreground="#555").grid(
-            row=7, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 0))
+            row=10, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 0))
 
         # 開始按鈕
         self.start_btn = ttk.Button(frm, text="開始批次蓋章", command=self.start)
-        self.start_btn.grid(row=8, column=0, columnspan=2, pady=12)
+        self.start_btn.grid(row=11, column=0, columnspan=2, pady=12)
 
         # 進度條
         self.progress = ttk.Progressbar(frm, length=600, mode="determinate")
-        self.progress.grid(row=9, column=0, columnspan=2, padx=10)
+        self.progress.grid(row=12, column=0, columnspan=2, padx=10)
 
         # 紀錄視窗
-        self.log_box = tk.Text(frm, height=14, width=76, state="disabled",
+        self.log_box = tk.Text(frm, height=10, width=76, state="disabled",
                                 bg="#f7f7f7")
-        self.log_box.grid(row=10, column=0, columnspan=2, padx=10, pady=10)
+        self.log_box.grid(row=13, column=0, columnspan=2, padx=10, pady=10)
 
         if fitz is None:
             self.log("⚠ 尚未安裝 PyMuPDF，PDF 功能無法使用。"
                       "請先在命令列執行: pip install PyMuPDF")
+
+    # -------- 後綴輸入框啟用/停用 --------
+    def _update_suffix_entry_state(self):
+        if self.suffix_choice.get() == "自訂":
+            self.suffix_entry.configure(state="normal")
+        else:
+            self.suffix_entry.configure(state="disabled")
+
+    def _resolve_suffix(self):
+        choice = self.suffix_choice.get()
+        if choice == "自訂":
+            text = self.suffix_custom.get().strip()
+            return text if text else "已蓋章"
+        return choice
 
     # -------- 選擇檔案/資料夾 --------
     def choose_input_dir(self):
@@ -410,12 +591,31 @@ class StampApp:
         self.log_box.configure(state="disabled")
 
         width_ratio = self.stamp_width_pct.get() / 100.0
+        position_code = POSITION_LABEL_TO_CODE.get(
+            self.position_label.get(), DEFAULT_POSITION)
+        mode_code = MODE_LABEL_TO_CODE.get(self.mode_label.get(), DEFAULT_MODE)
+        suffix = self._resolve_suffix()
+
+        # 記住這次的設定，下次開啟自動帶入
+        save_settings({
+            "input_dir": input_dir,
+            "stamp_path": stamp_path,
+            "output_dir": output_dir,
+            "stamp_width_pct": self.stamp_width_pct.get(),
+            "position_label": self.position_label.get(),
+            "mode_label": self.mode_label.get(),
+            "suffix_choice": self.suffix_choice.get(),
+            "suffix_custom": self.suffix_custom.get(),
+        })
 
         def worker():
             try:
                 batch_process(
                     input_dir, stamp_path, output_dir,
                     stamp_width_ratio=width_ratio,
+                    position=position_code,
+                    mode=mode_code,
+                    suffix=suffix,
                     log=self.log,
                     progress_cb=self.set_progress,
                 )
