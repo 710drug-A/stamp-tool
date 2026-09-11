@@ -184,30 +184,35 @@ def load_stamp_rgba(stamp_path, white_thresh=225, feather=35):
 # ============================================================
 # 文字自動產生章（不用準備圖片檔）
 # ============================================================
-def _draw_spaced_text(draw, text, cx, y_top, font, fill, extra_gap=0.5):
-    """畫一行文字，字與字之間留一點間距，整體以 cx 水平置中。回傳這行文字高度。"""
+def _draw_spaced_text(draw, text, x, y_top, font, fill, extra_gap=0.5, align="center"):
+    """
+    畫一行文字，字與字之間留一點間距。
+    align="center": x 視為水平置中點；align="left": x 視為文字最左邊起點。
+    回傳 (這行文字高度, 這行文字總寬度)。
+    """
     if not text:
-        return 0
+        return 0, 0
     infos = []
     for ch in text:
         bbox = draw.textbbox((0, 0), ch, font=font)
         infos.append((ch, bbox[2] - bbox[0], bbox[1], bbox[3]))
     gap = max(1, int(font.size * extra_gap))
     total_w = sum(w for _, w, _, _ in infos) + gap * (len(infos) - 1)
-    x = cx - total_w // 2
+    cur_x = (x - total_w // 2) if align == "center" else x
     max_h = max((b3 - b1) for _, _, b1, b3 in infos)
     for ch, w, b1, b3 in infos:
-        draw.text((x, y_top - b1), ch, font=font, fill=fill)
-        x += w + gap
-    return max_h
+        draw.text((cur_x, y_top - b1), ch, font=font, fill=fill)
+        cur_x += w + gap
+    return max_h, total_w
 
 
 def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
                          color=(200, 0, 0), canvas_size=(640, 260), border=9):
     """
-    產生一個紅框文字章（RGBA，透明背景），版面為橫式：
-      - 第一行（選填）：單位/科別，小字、字距較開，例如「藥劑科」
-      - 第二行：職稱（小字，選填） + 姓名（大字，必填），例如「院聘主任 方喬玲」
+    產生一個紅框文字章（RGBA，透明背景）。版面：
+      - 左側：單位/科別、職稱，字較小、靠左排列（由上到下堆疊）
+      - 右側：姓名，字較大，盡量撐滿章的高度
+      - 如果單位、職稱都沒填，姓名會置中並撐滿整個章
     """
     name = (name or "").strip()
     title = (title or "").strip()
@@ -231,57 +236,67 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
                     outline=fill, width=border)
 
     pad = border + int(H * 0.08)
-    cx = W // 2
-    cursor_y = pad
-    inner_bottom = H - pad
+    inner_left, inner_right = pad, W - pad
+    inner_top, inner_bottom = pad, H - pad
+    avail_w = inner_right - inner_left
+    avail_h = inner_bottom - inner_top
 
-    if unit:
-        unit_font = get_cjk_font(int(H * 0.20), custom_font_path)
-        h = _draw_spaced_text(draw, unit, cx, cursor_y, unit_font, fill, extra_gap=0.9)
-        cursor_y += int(h * 1.5)
+    def _fit_name(font_size, max_w):
+        """把姓名的字級縮小到能放進 max_w 內，回傳 (font, bbox, width)"""
+        font = get_cjk_font(font_size, custom_font_path)
+        bbox = draw.textbbox((0, 0), name, font=font)
+        w = bbox[2] - bbox[0]
+        if w > max_w and w > 0:
+            scale = (max_w / w) * 0.97
+            font_size = max(14, int(font_size * scale))
+            font = get_cjk_font(font_size, custom_font_path)
+            bbox = draw.textbbox((0, 0), name, font=font)
+            w = bbox[2] - bbox[0]
+        return font, bbox, w
 
-    remaining_top, remaining_bottom = cursor_y, inner_bottom
-    name_font_size = max(18, int((remaining_bottom - remaining_top) * 0.86))
-    title_font_size = max(12, int(name_font_size * 0.5))
+    has_left_block = bool(unit or title)
 
-    available_w = (W - 2 * pad)
+    if not has_left_block:
+        # 沒有單位/職稱：姓名置中，盡量撐滿整個章
+        name_font, bbox_n, n_w = _fit_name(int(avail_h * 0.92), avail_w * 0.96)
+        n_h = bbox_n[3] - bbox_n[1]
+        cx, cy = W // 2, H // 2
+        tx = cx - n_w // 2 - bbox_n[0]
+        ty = cy - n_h // 2 - bbox_n[1]
+        draw.text((tx, ty), name, font=name_font, fill=fill)
+        return img
 
-    def _measure(name_fs, title_fs):
-        nf = get_cjk_font(name_fs, custom_font_path)
-        tf = get_cjk_font(title_fs, custom_font_path) if title else None
-        t_w, t_bbox = 0, None
-        if title:
-            t_bbox = draw.textbbox((0, 0), title, font=tf)
-            t_w = t_bbox[2] - t_bbox[0]
-        n_bbox = draw.textbbox((0, 0), name, font=nf)
-        n_w = n_bbox[2] - n_bbox[0]
-        gap_ = int(name_fs * 0.18) if title else 0
-        return nf, tf, t_w, t_bbox, n_w, n_bbox, gap_
+    # 有單位/職稱：左欄放單位+職稱（靠左、由上到下），右欄放姓名（大字）
+    left_col_w = int(avail_w * 0.40)
+    col_gap = int(avail_w * 0.035)
+    left_x = inner_left
+    right_x0 = inner_left + left_col_w + col_gap
+    right_w = max(20, inner_right - right_x0)
 
-    name_font, title_font, title_w, bbox_t, name_w, bbox_n, gap = _measure(
-        name_font_size, title_font_size)
-    total_w = title_w + gap + name_w
+    # -- 左欄：單位（上）、職稱（下），靠左對齊，整體垂直置中 --
+    small_font_size = max(12, int(avail_h * 0.19))
+    small_font = get_cjk_font(small_font_size, custom_font_path)
+    lines = [t for t in (unit, title) if t]
+    line_gap = int(small_font_size * 0.35)
 
-    if total_w > available_w:
-        scale = (available_w / total_w) * 0.96
-        name_font_size = max(12, int(name_font_size * scale))
-        title_font_size = max(10, int(title_font_size * scale))
-        name_font, title_font, title_w, bbox_t, name_w, bbox_n, gap = _measure(
-            name_font_size, title_font_size)
-        total_w = title_w + gap + name_w
+    heights = [draw.textbbox((0, 0), line, font=small_font)[3] -
+               draw.textbbox((0, 0), line, font=small_font)[1] for line in lines]
+    total_left_h = sum(heights) + line_gap * (len(lines) - 1)
+    cur_y = inner_top + (avail_h - total_left_h) // 2
 
-    x = cx - total_w // 2
-    row_center_y = remaining_top + (remaining_bottom - remaining_top) // 2
+    for line, lh in zip(lines, heights):
+        _draw_spaced_text(draw, line, left_x, cur_y, small_font, fill,
+                           extra_gap=0.5, align="left")
+        cur_y += lh + line_gap
 
-    if title:
-        th = bbox_t[3] - bbox_t[1]
-        ty = row_center_y - th // 2 - bbox_t[1]
-        draw.text((x - bbox_t[0], ty), title, font=title_font, fill=fill)
-        x += title_w + gap
-
-    nh = bbox_n[3] - bbox_n[1]
-    ny = row_center_y - nh // 2 - bbox_n[1]
-    draw.text((x - bbox_n[0], ny), name, font=name_font, fill=fill)
+    # -- 右欄：姓名，盡量撐滿章的高度，在右欄範圍內水平置中 --
+    name_font, bbox_n, n_w = _fit_name(int(avail_h * 0.92), right_w * 0.96)
+    n_h = bbox_n[3] - bbox_n[1]
+    name_cx = right_x0 + right_w // 2
+    name_cy = inner_top + avail_h // 2
+    tx = name_cx - n_w // 2 - bbox_n[0]
+    ty = name_cy - n_h // 2 - bbox_n[1]
+    draw.text((tx, ty), name, font=name_font, fill=fill)
 
     return img
 
