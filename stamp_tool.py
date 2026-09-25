@@ -388,6 +388,161 @@ def get_search_region(width, height, position=DEFAULT_POSITION,
     return x0, y0, x1, y1
 
 
+def get_pdf_content_boxes(page):
+    """
+    讀取 PDF 頁面上『實際有內容』的區域（文字、線條/圖形），回傳一堆
+    (x0,y0,x1,y1) 矩形（單位: point）。用來判斷某個區域是否真的空白，
+    比單純看渲染後圖片的顏色更準確、也不受掃描雜訊影響。
+
+    注意：
+    - 圖形部分刻意取每一筆繪圖動作（線段/矩形/曲線）『自己』的邊界，而不是
+      整個路徑（例如一整張表格的框線＋格線，或一條彎曲折線圖）的外框邊界，
+      否則格子裡其實是空的表格、或只是細線的折線圖，會被誤判成整塊都有內容。
+    - 白色填色的矩形（例如整頁的白色背景）視為空白，不算佔用內容。
+    - 內嵌圖片（例如圖表）刻意不列入這裡的「嚴格內容」清單：圖片內部往往
+      有大片真正空白的背景，那部分交給「實際渲染顏色」（gray）判斷，
+      不要把整張圖片的外框都當成滿版佔用，否則圖表空白處會被誤擋。
+    """
+    boxes = []
+    try:
+        for w_ in page.get_text("words"):
+            boxes.append((w_[0], w_[1], w_[2], w_[3]))
+    except Exception:
+        pass
+    try:
+        for d in page.get_drawings():
+            fill_color = d.get("fill")
+            is_filled = fill_color is not None and not (
+                all(c >= 0.92 for c in fill_color) if fill_color else False)
+            line_w = max(0.5, d.get("width") or 1.0)
+            for item in d.get("items", []):
+                op = item[0]
+                try:
+                    if op == "l":
+                        p1, p2 = item[1], item[2]
+                        xs, ys = [p1.x, p2.x], [p1.y, p2.y]
+                        boxes.append((min(xs) - 1, min(ys) - 1, max(xs) + 1, max(ys) + 1))
+                    elif op == "re":
+                        r = item[1]
+                        if is_filled:
+                            boxes.append((r.x0, r.y0, r.x1, r.y1))
+                        else:
+                            lw = line_w
+                            boxes.append((r.x0 - lw, r.y0 - lw, r.x1 + lw, r.y0 + lw))
+                            boxes.append((r.x0 - lw, r.y1 - lw, r.x1 + lw, r.y1 + lw))
+                            boxes.append((r.x0 - lw, r.y0 - lw, r.x0 + lw, r.y1 + lw))
+                            boxes.append((r.x1 - lw, r.y0 - lw, r.x1 + lw, r.y1 + lw))
+                    elif op in ("c", "qu"):
+                        pts = [(p.x, p.y) for p in item[1:] if hasattr(p, "x")]
+                        if pts:
+                            xs = [p[0] for p in pts]
+                            ys = [p[1] for p in pts]
+                            boxes.append((min(xs) - 1, min(ys) - 1, max(xs) + 1, max(ys) + 1))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return boxes
+
+
+def _rect_intersection_area(a, b):
+    x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+    x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0)
+
+
+def _content_free_score(rect, content_boxes):
+    """回傳 rect 這塊區域『沒有被實際內容佔用』的比例，1.0 代表完全空白"""
+    rect_area = max(1e-6, (rect[2] - rect[0]) * (rect[3] - rect[1]))
+    occupied = 0.0
+    for cb in content_boxes:
+        occupied += _rect_intersection_area(rect, cb)
+    occupied = min(occupied, rect_area)
+    return 1.0 - occupied / rect_area
+
+
+def layout_custom_stamps(canvas_w, canvas_h, indexed_specs,
+                          content_boxes=None, gray=None, log=print):
+    """
+    處理 position=='custom' 的章：使用 spec 裡的 custom_x_pct/custom_y_pct
+    （畫布寬高的百分比）當作精確位置。
+
+    - content_boxes（PDF 文字/圖形的實際座標，point 空間）跟 gray（圖片/
+      頁面像素）可以同時提供：兩種判斷方式都必須認為夠空白才算數（取較
+      保守的分數），避免其中一種方法的誤判掩蓋掉另一種方法正確抓到的重疊。
+    - 如果該處剛好有內容重疊，會自動在附近（±12% 畫布範圍）就近找一個真正
+      空白的位置；附近還是找不到，最後會搜尋「整頁」最空白的地方。
+    - indexed_specs: [(原始index, spec), ...]
+    - 回傳: {原始index: {'x','y','w','h','score'}}
+    """
+    results = {}
+    placed_boxes = list(content_boxes) if content_boxes is not None else []
+
+    def score_at(rx, ry, w, h):
+        rect = (rx, ry, rx + w, ry + h)
+        scores = []
+        if content_boxes is not None:
+            scores.append(_content_free_score(rect, placed_boxes))
+        if gray is not None:
+            window = gray[int(ry):int(ry + h), int(rx):int(rx + w)]
+            if window.size > 0:
+                scores.append(float(np.mean(window > 235)))
+        if not scores:
+            return 1.0
+        return min(scores)
+
+    for orig_i, spec in indexed_specs:
+        w = max(20, int(canvas_w * spec["width_ratio"]))
+        ratio = w / spec["rgba"].width
+        h = max(20, int(spec["rgba"].height * ratio))
+
+        x_pct = spec.get("custom_x_pct", 75) / 100.0
+        y_pct = spec.get("custom_y_pct", 80) / 100.0
+        x0 = int(max(0, min(int(canvas_w * x_pct), canvas_w - w)))
+        y0 = int(max(0, min(int(canvas_h * y_pct), canvas_h - h)))
+
+        base_score = score_at(x0, y0, w, h)
+        best_score, best_x, best_y = base_score, x0, y0
+        label = spec.get("label", "章")
+
+        if base_score < 0.85:
+            radius_x = max(1, int(canvas_w * 0.12))
+            radius_y = max(1, int(canvas_h * 0.12))
+            step = max(4, int(canvas_w * 0.01))
+            for dy in range(-radius_y, radius_y + 1, step):
+                for dx in range(-radius_x, radius_x + 1, step):
+                    rx = int(max(0, min(x0 + dx, canvas_w - w)))
+                    ry = int(max(0, min(y0 + dy, canvas_h - h)))
+                    s = score_at(rx, ry, w, h)
+                    if s > best_score:
+                        best_score, best_x, best_y = s, rx, ry
+
+            if best_score >= 0.85:
+                log(f"    [{label}] 自訂座標處有內容重疊（空白分數 {base_score:.2f}），"
+                    f"已自動就近調整到較空白處（分數 {best_score:.2f}）")
+            else:
+                step2 = max(6, int(canvas_w * 0.02))
+                for ry in range(0, int(canvas_h - h) + 1, step2):
+                    for rx in range(0, int(canvas_w - w) + 1, step2):
+                        s = score_at(rx, ry, w, h)
+                        if s > best_score:
+                            best_score, best_x, best_y = s, rx, ry
+                if best_score >= 0.85:
+                    log(f"    [{label}] 自訂座標附近都有內容重疊，已改在全頁搜尋到"
+                        f"的最空白處蓋章（分數 {best_score:.2f}），位置可能跟指定的不一樣，"
+                        f"建議之後手動調整這個章的 X/Y% 設定")
+                else:
+                    log(f"    [{label}] 整頁幾乎都是滿版內容（最好分數僅 {best_score:.2f}），"
+                        f"找不到理想的空白處，已蓋在相對最空白的位置，建議檢查蓋章效果")
+
+        results[orig_i] = {"x": best_x, "y": best_y, "w": w, "h": h, "score": best_score}
+        placed_boxes.append((best_x, best_y, best_x + w, best_y + h))
+
+    return results
+
+
 def layout_stamps(canvas_w, canvas_h, stamp_specs, mode=DEFAULT_MODE,
                    gray=None, add_timestamp=False, log=print):
     """
@@ -479,9 +634,24 @@ def stamp_image_file(input_path, output_path, stamps,
     img = Image.open(input_path).convert("RGB")
     W, H = img.size
 
-    gray = np.array(img.convert("L")) if mode == "smart" else None
-    layout = layout_stamps(W, H, stamps, mode=mode, gray=gray,
-                            add_timestamp=add_timestamp, log=log)
+    custom_idx = [i for i, s in enumerate(stamps) if s.get("position") == "custom"]
+    preset_idx = [i for i in range(len(stamps)) if i not in custom_idx]
+
+    gray = np.array(img.convert("L")) if (mode == "smart" or custom_idx) else None
+    layout = [None] * len(stamps)
+
+    if custom_idx:
+        indexed = [(i, stamps[i]) for i in custom_idx]
+        custom_results = layout_custom_stamps(W, H, indexed, gray=gray, log=log)
+        for i, r in custom_results.items():
+            layout[i] = r
+
+    if preset_idx:
+        preset_specs = [stamps[i] for i in preset_idx]
+        preset_layout = layout_stamps(W, H, preset_specs, mode=mode, gray=gray,
+                                       add_timestamp=add_timestamp, log=log)
+        for local_i, orig_i in enumerate(preset_idx):
+            layout[orig_i] = preset_layout[local_i]
 
     ts_text = datetime.now().strftime("%m/%d %H:%M") if add_timestamp else None
 
@@ -529,28 +699,54 @@ def stamp_pdf_file(input_path, output_path, stamps,
     page = doc[-1]
     page_rect = page.rect
 
-    gray = None
-    if mode == "smart":
-        mat = fitz.Matrix(render_zoom, render_zoom)
-        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
-        gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
-        canvas_w, canvas_h = pix.width, pix.height
-    else:
-        canvas_w, canvas_h = page_rect.width, page_rect.height
+    custom_idx = [i for i, s in enumerate(stamps) if s.get("position") == "custom"]
+    preset_idx = [i for i in range(len(stamps)) if i not in custom_idx]
 
-    layout = layout_stamps(canvas_w, canvas_h, stamps, mode=mode, gray=gray,
-                           add_timestamp=add_timestamp, log=log)
+    layout_pt = [None] * len(stamps)  # 最終統一用 point（頁面實際座標）儲存位置
 
-    scale = (1.0 / render_zoom) if (mode == "smart") else 1.0
+    if custom_idx:
+        content_boxes = get_pdf_content_boxes(page)
+        # 額外渲染一張 zoom=1.0 的灰階圖（1 point = 1 pixel，跟頁面 point
+        # 座標完全對齊），跟文字/圖形座標互相驗證
+        pix_pt = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0), colorspace=fitz.csGRAY)
+        gray_pt = np.frombuffer(pix_pt.samples, dtype=np.uint8).reshape(
+            pix_pt.height, pix_pt.width)
+        indexed = [(i, stamps[i]) for i in custom_idx]
+        custom_results = layout_custom_stamps(
+            page_rect.width, page_rect.height, indexed,
+            content_boxes=content_boxes, gray=gray_pt, log=log)
+        for i, r in custom_results.items():
+            layout_pt[i] = r
+
+    if preset_idx:
+        preset_specs = [stamps[i] for i in preset_idx]
+        gray = None
+        if mode == "smart":
+            mat = fitz.Matrix(render_zoom, render_zoom)
+            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+            gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+            canvas_w, canvas_h = pix.width, pix.height
+            scale = 1.0 / render_zoom
+        else:
+            canvas_w, canvas_h = page_rect.width, page_rect.height
+            scale = 1.0
+
+        preset_layout = layout_stamps(canvas_w, canvas_h, preset_specs, mode=mode,
+                                       gray=gray, add_timestamp=add_timestamp, log=log)
+        for local_i, orig_i in enumerate(preset_idx):
+            info = preset_layout[local_i]
+            layout_pt[orig_i] = {
+                "x": info["x"] * scale, "y": info["y"] * scale,
+                "w": info["w"] * scale, "h": info["h"] * scale,
+                "score": info["score"],
+            }
+
     ts_text = datetime.now().strftime("%m/%d %H:%M") if add_timestamp else None
 
     tmp_paths = []
     try:
-        for spec, info in zip(stamps, layout):
-            x_pt = info["x"] * scale
-            y_pt = info["y"] * scale
-            w_pt = info["w"] * scale
-            h_pt = info["h"] * scale
+        for spec, info in zip(stamps, layout_pt):
+            x_pt, y_pt, w_pt, h_pt = info["x"], info["y"], info["w"], info["h"]
 
             if info.get("score") is not None:
                 log(f"    [{spec['label']}] 最後一頁空白分數: {info['score']:.2f}")
@@ -611,6 +807,8 @@ def batch_process(input_dir, stamp_entries, output_dir,
             "width_ratio": entry.get("width_pct", 14) / 100.0,
             "position": entry.get("position", DEFAULT_POSITION),
             "offset_index": entry.get("offset_index", 0),
+            "custom_x_pct": entry.get("custom_x_pct", 75),
+            "custom_y_pct": entry.get("custom_y_pct", 80),
             "label": stamp_entry_label(entry),
         })
 
@@ -694,6 +892,9 @@ class AddStampDialog:
         self.name = tk.StringVar(value=e.get("name", ""))
         self.width_pct = tk.IntVar(value=e.get("width_pct", 14))
         self.offset_index = tk.IntVar(value=e.get("offset_index", 0))
+        self.use_custom_pos = tk.BooleanVar(value=(e.get("position") == "custom"))
+        self.custom_x_pct = tk.IntVar(value=e.get("custom_x_pct", 75))
+        self.custom_y_pct = tk.IntVar(value=e.get("custom_y_pct", 80))
         self.position_label = tk.StringVar(
             value=POSITION_CODE_TO_LABEL.get(e.get("position", DEFAULT_POSITION),
                                               POSITION_CHOICES[0][1]))
@@ -738,9 +939,37 @@ class AddStampDialog:
 
         row += 1
         ttk.Label(self.win, text="蓋章位置：").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Combobox(self.win, textvariable=self.position_label, state="readonly",
-                     width=16, values=[l for _, l in POSITION_CHOICES]).grid(
-            row=row, column=1, sticky="w")
+        self.position_combo = ttk.Combobox(
+            self.win, textvariable=self.position_label, state="readonly",
+            width=16, values=[l for _, l in POSITION_CHOICES])
+        self.position_combo.grid(row=row, column=1, sticky="w")
+
+        row += 1
+        custom_frm = ttk.Frame(self.win)
+        custom_frm.grid(row=row, column=0, columnspan=3, sticky="w", padx=10)
+        self.custom_check = ttk.Checkbutton(
+            custom_frm, text="改用自訂精確座標（適合固定格式、常常收到的報表）",
+            variable=self.use_custom_pos, command=self._refresh_position_mode)
+        self.custom_check.pack(side="left")
+
+        row += 1
+        coord_frm = ttk.Frame(self.win)
+        coord_frm.grid(row=row, column=0, columnspan=3, sticky="w", padx=30)
+        ttk.Label(coord_frm, text="X（左邊算起的%）：").pack(side="left")
+        self.x_spin = ttk.Spinbox(coord_frm, from_=0, to=95, textvariable=self.custom_x_pct, width=5)
+        self.x_spin.pack(side="left")
+        ttk.Label(coord_frm, text="　Y（上面算起的%）：").pack(side="left")
+        self.y_spin = ttk.Spinbox(coord_frm, from_=0, to=95, textvariable=self.custom_y_pct, width=5)
+        self.y_spin.pack(side="left")
+
+        row += 1
+        ttk.Label(
+            self.win,
+            text="（X/Y 是章的左上角要落在文件的第幾% 位置，例如 X=75、Y=80 大約\n"
+                 "　落在右下角附近。程式會先試這個位置，如果剛好疊到文字/圖表內容，\n"
+                 "　會自動在附近微調到真正空白處。）",
+            foreground="#777", justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=10)
 
         row += 1
         ttk.Label(self.win, text="章的大小（佔文件寬度%）：").grid(
@@ -769,6 +998,13 @@ class AddStampDialog:
         ttk.Button(btn_frm, text="取消", command=self.win.destroy).pack(side="left", padx=6)
 
         self._refresh()
+        self._refresh_position_mode()
+
+    def _refresh_position_mode(self):
+        use_custom = self.use_custom_pos.get()
+        self.position_combo.configure(state="disabled" if use_custom else "readonly")
+        self.x_spin.configure(state="normal" if use_custom else "disabled")
+        self.y_spin.configure(state="normal" if use_custom else "disabled")
 
     def _refresh(self):
         is_image = self.source.get() == "image"
@@ -806,8 +1042,10 @@ class AddStampDialog:
             "name": self.name.get().strip(),
             "width_pct": self.width_pct.get(),
             "offset_index": self.offset_index.get(),
-            "position": POSITION_LABEL_TO_CODE.get(
-                self.position_label.get(), DEFAULT_POSITION),
+            "position": ("custom" if self.use_custom_pos.get() else
+                         POSITION_LABEL_TO_CODE.get(self.position_label.get(), DEFAULT_POSITION)),
+            "custom_x_pct": self.custom_x_pct.get(),
+            "custom_y_pct": self.custom_y_pct.get(),
         }
         self.on_save(entry)
         self.win.destroy()
@@ -939,7 +1177,10 @@ class StampApp:
         for e in self.stamp_entries:
             src = "文字章" if e.get("source") == "text" else "圖片章"
             label = stamp_entry_label(e)
-            pos = POSITION_CODE_TO_LABEL.get(e.get("position"), "")
+            if e.get("position") == "custom":
+                pos = f"自訂座標({e.get('custom_x_pct', 75)}%,{e.get('custom_y_pct', 80)}%)"
+            else:
+                pos = POSITION_CODE_TO_LABEL.get(e.get("position"), "")
             off = e.get("offset_index", 0)
             off_txt = f"　讓開:{off}格" if off else ""
             self.stamp_listbox.insert(
