@@ -124,15 +124,16 @@ def get_ascii_font(size):
 
 # 常見中文字型名稱（Windows 會自動去 %WINDIR%\Fonts 找同名檔案）
 _CJK_FONT_CANDIDATES = [
-    "mingliu.ttc",   # 細明體（繁中 Windows 必有）
-    "kaiu.ttf",      # 標楷體 DFKai-SB
+    "kaiu.ttf",      # 標楷體 DFKai-SB（繁中 Windows 必有，印章慣用字體）
+    "biaokai.ttc", "Kaiti SC", "Kaiti TC", "Kaiti TC Regular",  # macOS 對應字型
+    "mingliu.ttc",   # 細明體
     "msjh.ttc", "MSJH.TTC",   # 微軟正黑體
     "simsun.ttc",    # 新細明體
     "msyh.ttc",      # 微軟雅黑
     "PingFang.ttc",  # macOS
-    # 下面這幾個是 Linux 常見路徑，主要給開發/測試用
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    # 下面這幾個是 Linux 常見路徑，主要給開發/測試用（Serif 較接近楷體筆劃）
     "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
 ]
 
@@ -206,8 +207,42 @@ def _draw_spaced_text(draw, text, x, y_top, font, fill, extra_gap=0.5, align="ce
     return max_h, total_w
 
 
+def _draw_justified_text(draw, text, x_left, col_w, y_top, font, fill):
+    """
+    畫一行文字，讓字元『兩端對齊』撐滿 col_w 這個欄寬（第一個字貼齊左邊、
+    最後一個字貼齊右邊，中間平均分配間距）－－常見於印章職稱欄位的排版。
+    只有一個字時就直接靠左；字數多到自然寬度已經超過欄寬時，改用小間距
+    正常排列（不勉強硬擠出負間距）。
+    回傳這行文字的高度。
+    """
+    if not text:
+        return 0
+    infos = []
+    for ch in text:
+        bbox = draw.textbbox((0, 0), ch, font=font)
+        infos.append((ch, bbox[2] - bbox[0], bbox[1], bbox[3]))
+    max_h = max((b3 - b1) for _, _, b1, b3 in infos)
+
+    if len(infos) == 1:
+        ch, w, b1, b3 = infos[0]
+        draw.text((x_left, y_top - b1), ch, font=font, fill=fill)
+        return max_h
+
+    total_char_w = sum(w for _, w, _, _ in infos)
+    gap = (col_w - total_char_w) / (len(infos) - 1)
+    min_gap = font.size * 0.08
+    if gap < min_gap:
+        gap = min_gap  # 字數太多、欄寬不夠時，退回小間距正常排列
+
+    cur_x = x_left
+    for ch, w, b1, b3 in infos:
+        draw.text((cur_x, y_top - b1), ch, font=font, fill=fill)
+        cur_x += w + gap
+    return max_h
+
+
 def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
-                         color=(200, 0, 0), canvas_size=(640, 260), border=9):
+                         color=(200, 0, 0), canvas_size=None, border=9):
     """
     產生一個紅框文字章（RGBA，透明背景）。版面：
       - 左側：單位/科別、職稱，字較小、靠左排列（由上到下堆疊）
@@ -226,6 +261,11 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
             "找不到可用的中文字型，無法產生文字章。"
             "請在「自訂中文字型檔」欄位指定一個 .ttf/.otf 字型檔，"
             "或改用準備好的印章圖片檔。")
+
+    # 章的外框比例固定不變（不因為左側是 1 行或 2 行而改變），
+    # 行數變化改成調整「左側文字的字級大小」來塞進同樣大小的框裡
+    if canvas_size is None:
+        canvas_size = (640, 260)
 
     W, H = canvas_size
     img = Image.new("RGBA", (W, H), (255, 255, 255, 0))
@@ -273,20 +313,38 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
     right_x0 = inner_left + left_col_w + col_gap
     right_w = max(20, inner_right - right_x0)
 
-    # -- 左欄：單位（上）、職稱（下），靠左對齊，整體垂直置中 --
-    small_font_size = max(12, int(avail_h * 0.19))
-    small_font = get_cjk_font(small_font_size, custom_font_path)
+    # -- 左欄：單位（上）、職稱（下），兩端對齊撐滿左欄寬度，整體垂直置中 --
+    # 字級依左欄行數自動縮小：1 行時字可以大一點、撐滿高度；
+    # 2 行時每行字要縮小，兩行加起來才塞得進同樣高度的框裡
     lines = [t for t in (unit, title) if t]
+    n_lines = len(lines) if lines else 1
+    if n_lines <= 1:
+        small_font_size = max(12, int(avail_h * 0.34))
+    else:
+        small_font_size = max(10, int(avail_h * 0.16))
+    small_font = get_cjk_font(small_font_size, custom_font_path)
+
+    # 字級除了要塞得下高度，也要塞得下寬度（例如「醫事放射師」5 個字單行時
+    # 字放大後可能超出左欄寬度），超出的話依比例縮小
+    if lines:
+        max_line_w = 0
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=small_font)
+            max_line_w = max(max_line_w, bbox[2] - bbox[0])
+        if max_line_w > left_col_w and max_line_w > 0:
+            scale = (left_col_w / max_line_w) * 0.97
+            small_font_size = max(8, int(small_font_size * scale))
+            small_font = get_cjk_font(small_font_size, custom_font_path)
+
     line_gap = int(small_font_size * 0.35)
 
     heights = [draw.textbbox((0, 0), line, font=small_font)[3] -
                draw.textbbox((0, 0), line, font=small_font)[1] for line in lines]
-    total_left_h = sum(heights) + line_gap * (len(lines) - 1)
+    total_left_h = sum(heights) + line_gap * (len(lines) - 1) if lines else 0
     cur_y = inner_top + (avail_h - total_left_h) // 2
 
     for line, lh in zip(lines, heights):
-        _draw_spaced_text(draw, line, left_x, cur_y, small_font, fill,
-                           extra_gap=0.5, align="left")
+        _draw_justified_text(draw, line, left_x, left_col_w, cur_y, small_font, fill)
         cur_y += lh + line_gap
 
     # -- 右欄：姓名，盡量撐滿章的高度，在右欄範圍內水平置中 --
