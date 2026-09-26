@@ -242,7 +242,7 @@ def _draw_justified_text(draw, text, x_left, col_w, y_top, font, fill):
 
 
 def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
-                         color=(200, 0, 0), canvas_size=None, border=9):
+                         color=(224, 24, 24), canvas_size=None, border=9):
     """
     產生一個紅框文字章（RGBA，透明背景）。版面：
       - 左側：單位/科別、職稱，字較小、靠左排列（由上到下堆疊）
@@ -275,7 +275,7 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
     draw.rectangle([border // 2, border // 2, W - 1 - border // 2, H - 1 - border // 2],
                     outline=fill, width=border)
 
-    pad = border + int(H * 0.08)
+    pad = border + int(H * 0.05)
     inner_left, inner_right = pad, W - pad
     inner_top, inner_bottom = pad, H - pad
     avail_w = inner_right - inner_left
@@ -319,9 +319,9 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
     lines = [t for t in (unit, title) if t]
     n_lines = len(lines) if lines else 1
     if n_lines <= 1:
-        small_font_size = max(12, int(avail_h * 0.34))
+        small_font_size = max(12, int(avail_h * 0.40))
     else:
-        small_font_size = max(10, int(avail_h * 0.16))
+        small_font_size = max(10, int(avail_h * 0.25))
     small_font = get_cjk_font(small_font_size, custom_font_path)
 
     # 字級除了要塞得下高度，也要塞得下寬度（例如「醫事放射師」5 個字單行時
@@ -336,7 +336,7 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
             small_font_size = max(8, int(small_font_size * scale))
             small_font = get_cjk_font(small_font_size, custom_font_path)
 
-    line_gap = int(small_font_size * 0.35)
+    line_gap = int(small_font_size * 0.20)
 
     heights = [draw.textbbox((0, 0), line, font=small_font)[3] -
                draw.textbbox((0, 0), line, font=small_font)[1] for line in lines]
