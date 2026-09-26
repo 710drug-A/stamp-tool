@@ -265,7 +265,7 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
     # 章的外框比例固定不變（不因為左側是 1 行或 2 行而改變），
     # 行數變化改成調整「左側文字的字級大小」來塞進同樣大小的框裡
     if canvas_size is None:
-        canvas_size = (640, 260)
+        canvas_size = (640, 210)
 
     W, H = canvas_size
     img = Image.new("RGBA", (W, H), (255, 255, 255, 0))
@@ -307,36 +307,59 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
         return img
 
     # 有單位/職稱：左欄放單位+職稱（靠左、由上到下），右欄放姓名（大字）
-    left_col_w = int(avail_w * 0.40)
+    lines = [t for t in (unit, title) if t]
+    n_lines = len(lines) if lines else 1
+
+    # 姓名的字級（右側基準），左側「單行 3 個字」的職稱要跟這個一樣大
+    name_ref_font_size = int(avail_h * 0.92)
+
+    if n_lines <= 1:
+        small_font_size = name_ref_font_size
+    else:
+        # 兩行職稱時字級要明顯放大（不是隨便縮到塞得下就好）
+        small_font_size = max(12, int(avail_h * 0.40))
+    small_font = get_cjk_font(small_font_size, custom_font_path)
+
+    # 欄寬不是固定比例，而是依內容計算：以「3 個字」為基準寬度，
+    # 這樣單行 3 個字剛好自然填滿欄寬、2 個字兩端對齊時中間自然空出一格；
+    # 如果某一行字數比 3 多（例如「醫事放射師」5 個字），欄寬跟著加大
+    slot_count = max(3, max((len(line) for line in lines), default=3))
+    sample_char = max((c for line in lines for c in line),
+                       key=lambda c: draw.textbbox((0, 0), c, font=small_font)[2]
+                       - draw.textbbox((0, 0), c, font=small_font)[0])
+    cbbox = draw.textbbox((0, 0), sample_char, font=small_font)
+    avg_char_w = cbbox[2] - cbbox[0]
+    char_gap = avg_char_w * 0.15
+    left_col_w = int(slot_count * avg_char_w + (slot_count - 1) * char_gap)
+
+    # 左欄最多只能佔用可用寬度的 55%，避免壓縮到姓名的空間；
+    # 超過的話依比例縮小字級重新計算
+    max_left_col_w = int(avail_w * 0.55)
+    if left_col_w > max_left_col_w:
+        scale = (max_left_col_w / left_col_w) * 0.98
+        small_font_size = max(10, int(small_font_size * scale))
+        small_font = get_cjk_font(small_font_size, custom_font_path)
+        cbbox = draw.textbbox((0, 0), sample_char, font=small_font)
+        avg_char_w = cbbox[2] - cbbox[0]
+        char_gap = avg_char_w * 0.15
+        left_col_w = int(slot_count * avg_char_w + (slot_count - 1) * char_gap)
+
     col_gap = int(avail_w * 0.035)
     left_x = inner_left
     right_x0 = inner_left + left_col_w + col_gap
     right_w = max(20, inner_right - right_x0)
 
-    # -- 左欄：單位（上）、職稱（下），兩端對齊撐滿左欄寬度，整體垂直置中 --
-    # 字級依左欄行數自動縮小：1 行時字可以大一點、撐滿高度；
-    # 2 行時每行字要縮小，兩行加起來才塞得進同樣高度的框裡
-    lines = [t for t in (unit, title) if t]
-    n_lines = len(lines) if lines else 1
-    if n_lines <= 1:
-        small_font_size = max(12, int(avail_h * 0.40))
-    else:
-        small_font_size = max(10, int(avail_h * 0.25))
-    small_font = get_cjk_font(small_font_size, custom_font_path)
+    # 每一行也各自檢查寬度（例如兩行職稱其中一行特別長），超出就再縮小
+    max_line_w = 0
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=small_font)
+        max_line_w = max(max_line_w, bbox[2] - bbox[0])
+    if max_line_w > left_col_w and max_line_w > 0:
+        scale = (left_col_w / max_line_w) * 0.97
+        small_font_size = max(8, int(small_font_size * scale))
+        small_font = get_cjk_font(small_font_size, custom_font_path)
 
-    # 字級除了要塞得下高度，也要塞得下寬度（例如「醫事放射師」5 個字單行時
-    # 字放大後可能超出左欄寬度），超出的話依比例縮小
-    if lines:
-        max_line_w = 0
-        for line in lines:
-            bbox = draw.textbbox((0, 0), line, font=small_font)
-            max_line_w = max(max_line_w, bbox[2] - bbox[0])
-        if max_line_w > left_col_w and max_line_w > 0:
-            scale = (left_col_w / max_line_w) * 0.97
-            small_font_size = max(8, int(small_font_size * scale))
-            small_font = get_cjk_font(small_font_size, custom_font_path)
-
-    line_gap = int(small_font_size * 0.20)
+    line_gap = int(small_font_size * 0.15)
 
     heights = [draw.textbbox((0, 0), line, font=small_font)[3] -
                draw.textbbox((0, 0), line, font=small_font)[1] for line in lines]
@@ -348,7 +371,7 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
         cur_y += lh + line_gap
 
     # -- 右欄：姓名，盡量撐滿章的高度，在右欄範圍內水平置中 --
-    name_font, bbox_n, n_w = _fit_name(int(avail_h * 0.92), right_w * 0.96)
+    name_font, bbox_n, n_w = _fit_name(name_ref_font_size, right_w * 0.96)
     n_h = bbox_n[3] - bbox_n[1]
     name_cx = right_x0 + right_w // 2
     name_cy = inner_top + avail_h // 2
