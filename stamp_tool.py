@@ -84,6 +84,22 @@ MODE_LABEL_TO_CODE = {label: code for code, label in MODE_CHOICES}
 MODE_CODE_TO_LABEL = {code: label for code, label in MODE_CHOICES}
 DEFAULT_MODE = "fixed"
 
+# 時間戳記預設顏色（跟印章紅色一致）
+TIMESTAMP_DEFAULT_COLOR = (224, 24, 24)
+
+
+def format_stamp_timestamp(custom_text=None):
+    """
+    產生要印在章下方的時間文字。
+    custom_text 有填的話直接用那段文字（使用者手動指定）；
+    沒填就自動用「民國年/月/日 時:分」，例如 115/09/26 14:35。
+    """
+    if custom_text and custom_text.strip():
+        return custom_text.strip()
+    now = datetime.now()
+    minguo_year = now.year - 1911
+    return f"{minguo_year}/{now.month:02d}/{now.day:02d} {now.hour:02d}:{now.minute:02d}"
+
 # 設定檔：跟執行檔（或程式）放在同一個資料夾，記住上次用過的選項
 if getattr(sys, "frozen", False):
     _BASE_DIR = os.path.dirname(sys.executable)
@@ -344,10 +360,12 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
         char_gap = avg_char_w * 0.15
         left_col_w = int(slot_count * avg_char_w + (slot_count - 1) * char_gap)
 
-    col_gap = int(avail_w * 0.035)
+    col_gap = 0  # 左右兩欄中間完全不留間距
     left_x = inner_left
     right_x0 = inner_left + left_col_w + col_gap
-    right_w = max(20, inner_right - right_x0)
+    # 右側（姓名跟外框之間）多留一點空間，不要頂到邊
+    right_margin = int(avail_w * 0.05)
+    right_w = max(20, inner_right - right_x0 - right_margin)
 
     # 每一行也各自檢查寬度（例如兩行職稱其中一行特別長），超出就再縮小
     max_line_w = 0
@@ -624,6 +642,147 @@ def layout_custom_stamps(canvas_w, canvas_h, indexed_specs,
     return results
 
 
+def layout_stamps_in_strip(strip_w, stamp_specs, ts_reserve=0, log=print):
+    """
+    在『新增的空白區域』裡幫章排版。因為這塊區域本來就是全新加上去的空白，
+    不需要判斷版面內容、不會壓到任何文字。
+
+    stamp_specs 的 position 只取水平方向的意義（靠左/置中/靠右，或 custom
+    的 custom_x_pct），垂直方向一律在這塊新區域裡置中。
+
+    - 'offset_index' + 'stack_direction'：分次蓋章時，後面的章可以選擇跟
+      同一水平錨點的章排在右邊（'right'，預設）或下面（'down'）。
+    - ts_reserve：每個章下方要留給時間戳記文字的高度（沒開時間戳記就是 0），
+      往下疊的章之間會各自預留這塊空間，避免疊在一起。
+
+    回傳: (strip_h, results)
+      strip_h：這塊新區域需要的高度
+      results：對應每個 stamp_specs 的 {'x','y','w','h'}（相對於這塊新區域
+               左上角 (0,0)）
+    """
+    n = len(stamp_specs)
+    sized = []
+    for spec in stamp_specs:
+        w = max(20, int(strip_w * spec["width_ratio"]))
+        ratio = w / spec["rgba"].width
+        h = max(20, int(spec["rgba"].height * ratio))
+        sized.append((w, h))
+
+    margin_x = int(strip_w * 0.025)
+    gap = max(4, int(strip_w * 0.015))
+    if ts_reserve:
+        # 時間戳記文字通常比章本身寬，並排的章之間要多留一點空間，
+        # 避免兩個章下方的時間文字互相重疊
+        gap = max(gap, int(strip_w * 0.05))
+
+    groups = OrderedDict()
+    for idx, spec in enumerate(stamp_specs):
+        if spec.get("position") == "custom":
+            key = ("custom", idx)
+        else:
+            pos = spec.get("position", DEFAULT_POSITION)
+            anchor = ("left" if pos.endswith("left") else
+                      "right" if pos.endswith("right") else "center")
+            key = ("anchor", anchor)
+        groups.setdefault(key, []).append(idx)
+
+    def split_group(idxs):
+        down_idxs = [i for i in idxs if (stamp_specs[i].get("stack_direction") == "down"
+                                          and stamp_specs[i].get("offset_index", 0) > 0)]
+        row_idxs = [i for i in idxs if i not in down_idxs]
+        return row_idxs, down_idxs
+
+    def group_content_height(idxs):
+        """這一組（橫排列 + 下疊列）總共需要的高度，含每個章自己的時間戳記空間"""
+        row_idxs, down_idxs = split_group(idxs)
+        row_h = max((sized[i][1] for i in row_idxs), default=0)
+        row_total_h = (row_h + ts_reserve) if row_idxs else 0
+        if down_idxs:
+            down_total = (sum(sized[i][1] + ts_reserve for i in down_idxs)
+                          + gap * (len(down_idxs) - 1))
+            return (row_total_h + gap + down_total) if row_idxs else down_total
+        return row_total_h
+
+    strip_content_h = max((group_content_height(idxs) for idxs in groups.values()), default=20)
+    pad_y = int(strip_content_h * 0.18) + 6
+    strip_h = strip_content_h + pad_y * 2
+
+    results = [None] * n
+
+    for key, idxs in groups.items():
+        idxs_sorted = sorted(idxs, key=lambda i: stamp_specs[i].get("offset_index", 0))
+        row_idxs, down_idxs = split_group(idxs_sorted)
+
+        if key[0] == "custom":
+            x_pct = stamp_specs[idxs[0]].get("custom_x_pct", 75) / 100.0
+            base_anchor_x = int(strip_w * x_pct)
+            anchor = "custom"
+        else:
+            anchor = key[1]
+
+        total_w = (sum(sized[i][0] for i in row_idxs) + gap * (len(row_idxs) - 1)
+                   if row_idxs else 0)
+        if anchor == "left":
+            start_x = margin_x
+        elif anchor == "right":
+            start_x = strip_w - margin_x - total_w
+        elif anchor == "custom":
+            start_x = base_anchor_x
+        else:
+            start_x = strip_w // 2 - total_w // 2
+        start_x = max(0, start_x)
+
+        this_group_h = group_content_height(idxs)
+        row_top = pad_y + (strip_content_h - this_group_h) // 2
+        row_h = max((sized[i][1] for i in row_idxs), default=0)
+
+        cur_x = start_x
+        for i in row_idxs:
+            w, h = sized[i]
+            x = min(max(0, cur_x), max(0, strip_w - w))
+            y = row_top + (row_h - h) // 2
+            results[i] = {"x": x, "y": y, "w": w, "h": h, "score": None}
+            cur_x += w + gap
+
+        if down_idxs:
+            if row_idxs:
+                ref_x = results[row_idxs[0]]["x"]
+                cur_y = row_top + row_h + ts_reserve + gap
+            else:
+                ref_x = start_x
+                cur_y = row_top
+            for i in down_idxs:
+                w, h = sized[i]
+                x = min(max(0, ref_x), max(0, strip_w - w))
+                results[i] = {"x": x, "y": cur_y, "w": w, "h": h, "score": None}
+                cur_y += h + ts_reserve + gap
+
+        if len(idxs) > 1:
+            log(f"    (新增的空白區域) 有 {len(idxs)} 個章排在一起")
+
+    return strip_h, results
+
+
+def extend_image_with_blank_strip(img, strip_h):
+    """在圖片最下面加上一塊白色空白區域，回傳 (新圖片, 空白區域的起始 y)"""
+    W, H = img.size
+    new_img = Image.new("RGB", (W, H + strip_h), "white")
+    new_img.paste(img, (0, 0))
+    return new_img, H
+
+
+def extend_pdf_page_with_blank_strip(page, strip_h_pt):
+    """
+    在 PDF 最後一頁的下方加上一塊空白區域（延伸 mediabox，不會移動原本的
+    內容）。回傳空白區域的起始 y（point，沿用 fitz 慣用的左上角座標系統）。
+    """
+    orig_h = page.rect.height
+    mb = page.mediabox
+    new_mb = fitz.Rect(mb.x0, mb.y0 - strip_h_pt, mb.x1, mb.y1)
+    page.set_mediabox(new_mb)
+    return orig_h
+
+
 def layout_stamps(canvas_w, canvas_h, stamp_specs, mode=DEFAULT_MODE,
                    gray=None, add_timestamp=False, log=print):
     """
@@ -711,9 +870,47 @@ def layout_stamps(canvas_w, canvas_h, stamp_specs, mode=DEFAULT_MODE,
 # 蓋章：圖片檔
 # ============================================================
 def stamp_image_file(input_path, output_path, stamps,
-                      mode=DEFAULT_MODE, add_timestamp=False, log=print):
+                      mode=DEFAULT_MODE, add_timestamp=False,
+                      timestamp_text=None, timestamp_color=TIMESTAMP_DEFAULT_COLOR,
+                      extend_blank=False, log=print):
     img = Image.open(input_path).convert("RGB")
     W, H = img.size
+
+    ts_text = format_stamp_timestamp(timestamp_text) if add_timestamp else None
+
+    if extend_blank:
+        # 直接在圖片最下面加一塊全新的空白區域來蓋章，保證不會壓到原本的內容，
+        # 不需要判斷版面
+        ts_reserve = 0
+        if ts_text:
+            sample_font_size = max(14, int(W * 0.16 * 0.14))
+            ts_reserve = int(sample_font_size * 1.8)
+        strip_h, layout = layout_stamps_in_strip(W, stamps, ts_reserve=ts_reserve, log=log)
+        img, strip_y0 = extend_image_with_blank_strip(img, strip_h)
+        W, H = img.size
+        draw = ImageDraw.Draw(img)
+        for spec, info in zip(stamps, layout):
+            x, w, h = info["x"], info["w"], info["h"]
+            y = strip_y0 + info["y"]
+            resized = spec["rgba"].resize((w, h), Image.LANCZOS)
+            img.paste(resized, (x, y), resized)
+            if ts_text:
+                font_size = max(14, int(w * 0.16))
+                font = get_ascii_font(font_size)
+                bbox = draw.textbbox((0, 0), ts_text, font=font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                tx = x + (w - tw) // 2
+                ty = y + h + max(2, int(h * 0.03))
+                tx = max(0, min(tx, W - tw))
+                ty = min(ty, H - th)
+                draw.text((tx, ty), ts_text, fill=timestamp_color, font=font)
+
+        ext = os.path.splitext(output_path)[1].lower()
+        if ext in (".jpg", ".jpeg"):
+            img.save(output_path, quality=95)
+        else:
+            img.save(output_path)
+        return True
 
     custom_idx = [i for i, s in enumerate(stamps) if s.get("position") == "custom"]
     preset_idx = [i for i in range(len(stamps)) if i not in custom_idx]
@@ -734,8 +931,6 @@ def stamp_image_file(input_path, output_path, stamps,
         for local_i, orig_i in enumerate(preset_idx):
             layout[orig_i] = preset_layout[local_i]
 
-    ts_text = datetime.now().strftime("%m/%d %H:%M") if add_timestamp else None
-
     for spec, info in zip(stamps, layout):
         x, y, w, h = info["x"], info["y"], info["w"], info["h"]
         resized = spec["rgba"].resize((w, h), Image.LANCZOS)
@@ -754,7 +949,7 @@ def stamp_image_file(input_path, output_path, stamps,
             ty = y + h + max(2, int(h * 0.03))
             tx = max(0, min(tx, W - tw))
             ty = min(ty, H - th)
-            draw.text((tx, ty), ts_text, fill=(180, 0, 0), font=font)
+            draw.text((tx, ty), ts_text, fill=timestamp_color, font=font)
 
     ext = os.path.splitext(output_path)[1].lower()
     if ext in (".jpg", ".jpeg"):
@@ -769,7 +964,8 @@ def stamp_image_file(input_path, output_path, stamps,
 # ============================================================
 def stamp_pdf_file(input_path, output_path, stamps,
                     mode=DEFAULT_MODE, add_timestamp=False,
-                    render_zoom=1.5, log=print):
+                    timestamp_text=None, timestamp_color=TIMESTAMP_DEFAULT_COLOR,
+                    extend_blank=False, render_zoom=1.5, log=print):
     if fitz is None:
         raise RuntimeError("尚未安裝 PyMuPDF，請先執行: pip install PyMuPDF")
 
@@ -779,6 +975,46 @@ def stamp_pdf_file(input_path, output_path, stamps,
 
     page = doc[-1]
     page_rect = page.rect
+    ts_text = format_stamp_timestamp(timestamp_text) if add_timestamp else None
+
+    if extend_blank:
+        # 直接在最後一頁下方延伸出一塊全新的空白區域來蓋章，
+        # 保證不會壓到原本的內容，不需要判斷版面
+        ts_reserve = 0
+        if ts_text:
+            sample_font_size = max(8, min(14, page_rect.width * 0.16 * 0.15))
+            ts_reserve = sample_font_size * 1.8
+        strip_h, layout = layout_stamps_in_strip(page_rect.width, stamps, ts_reserve=ts_reserve, log=log)
+        strip_y0 = extend_pdf_page_with_blank_strip(page, strip_h)
+
+        tmp_paths = []
+        try:
+            for spec, info in zip(stamps, layout):
+                x_pt, w_pt, h_pt = info["x"], info["w"], info["h"]
+                y_pt = strip_y0 + info["y"]
+                rect = fitz.Rect(x_pt, y_pt, x_pt + w_pt, y_pt + h_pt)
+                tmp_path = output_path + f"._stamp_tmp_{len(tmp_paths)}.png"
+                spec["rgba"].save(tmp_path)
+                tmp_paths.append(tmp_path)
+                page.insert_image(rect, filename=tmp_path, overlay=True)
+
+                if ts_text:
+                    font_size = max(8, min(14, w_pt * 0.15))
+                    text_w = fitz.get_text_length(ts_text, fontname="helv", fontsize=font_size)
+                    tx = x_pt + (w_pt - text_w) / 2
+                    ty = y_pt + h_pt + font_size * 1.1
+                    ty = min(ty, page.rect.height - 2)
+                    tx = max(0, min(tx, page_rect.width - text_w))
+                    page.insert_text((tx, ty), ts_text, fontname="helv", fontsize=font_size,
+                                      color=tuple(c / 255.0 for c in timestamp_color))
+
+            doc.save(output_path, garbage=4, deflate=True)
+        finally:
+            doc.close()
+            for p in tmp_paths:
+                if os.path.exists(p):
+                    os.remove(p)
+        return True
 
     custom_idx = [i for i, s in enumerate(stamps) if s.get("position") == "custom"]
     preset_idx = [i for i in range(len(stamps)) if i not in custom_idx]
@@ -822,8 +1058,6 @@ def stamp_pdf_file(input_path, output_path, stamps,
                 "score": info["score"],
             }
 
-    ts_text = datetime.now().strftime("%m/%d %H:%M") if add_timestamp else None
-
     tmp_paths = []
     try:
         for spec, info in zip(stamps, layout_pt):
@@ -846,7 +1080,8 @@ def stamp_pdf_file(input_path, output_path, stamps,
                 ty = min(ty, page_rect.height - 2)
                 tx = max(0, min(tx, page_rect.width - text_w))
                 page.insert_text((tx, ty), ts_text, fontname="helv",
-                                  fontsize=font_size, color=(0.7, 0, 0))
+                                  fontsize=font_size,
+                                  color=tuple(c / 255.0 for c in timestamp_color))
 
         doc.save(output_path, garbage=4, deflate=True)
     finally:
@@ -873,7 +1108,10 @@ def _unique_dest_path(dest_dir, filename):
 
 def batch_process(input_dir, stamp_entries, output_dir,
                    mode=DEFAULT_MODE, suffix="已蓋章",
-                   add_timestamp=False, processed_dir=None,
+                   add_timestamp=False, timestamp_text=None,
+                   timestamp_color=TIMESTAMP_DEFAULT_COLOR,
+                   extend_blank=False,
+                   processed_dir=None,
                    custom_font_path=None,
                    log=print, progress_cb=None):
     if not stamp_entries:
@@ -888,6 +1126,7 @@ def batch_process(input_dir, stamp_entries, output_dir,
             "width_ratio": entry.get("width_pct", 14) / 100.0,
             "position": entry.get("position", DEFAULT_POSITION),
             "offset_index": entry.get("offset_index", 0),
+            "stack_direction": entry.get("stack_direction", "right"),
             "custom_x_pct": entry.get("custom_x_pct", 75),
             "custom_y_pct": entry.get("custom_y_pct", 80),
             "label": stamp_entry_label(entry),
@@ -925,10 +1164,16 @@ def batch_process(input_dir, stamp_entries, output_dir,
         try:
             if ext.lower() in SUPPORTED_PDF_EXT:
                 stamp_pdf_file(input_path, output_path, resolved_stamps,
-                                mode=mode, add_timestamp=add_timestamp, log=log)
+                                mode=mode, add_timestamp=add_timestamp,
+                                timestamp_text=timestamp_text,
+                                timestamp_color=timestamp_color,
+                                extend_blank=extend_blank, log=log)
             else:
                 stamp_image_file(input_path, output_path, resolved_stamps,
-                                  mode=mode, add_timestamp=add_timestamp, log=log)
+                                  mode=mode, add_timestamp=add_timestamp,
+                                  timestamp_text=timestamp_text,
+                                  timestamp_color=timestamp_color,
+                                  extend_blank=extend_blank, log=log)
             log(f"    ✔ 完成 -> {out_name}")
 
             if processed_dir:
@@ -973,6 +1218,8 @@ class AddStampDialog:
         self.name = tk.StringVar(value=e.get("name", ""))
         self.width_pct = tk.IntVar(value=e.get("width_pct", 14))
         self.offset_index = tk.IntVar(value=e.get("offset_index", 0))
+        self.stack_direction_label = tk.StringVar(
+            value="下方" if e.get("stack_direction") == "down" else "右方")
         self.use_custom_pos = tk.BooleanVar(value=(e.get("position") == "custom"))
         self.custom_x_pct = tk.IntVar(value=e.get("custom_x_pct", 75))
         self.custom_y_pct = tk.IntVar(value=e.get("custom_y_pct", 80))
@@ -1063,12 +1310,20 @@ class AddStampDialog:
             row=row, column=0, sticky="w", **pad)
         ttk.Spinbox(self.win, from_=0, to=5, textvariable=self.offset_index,
                     width=6).grid(row=row, column=1, sticky="w")
+
+        row += 1
+        ttk.Label(self.win, text="跟前面的章疊放方向：").grid(
+            row=row, column=0, sticky="w", **pad)
+        ttk.Combobox(self.win, textvariable=self.stack_direction_label, state="readonly",
+                     width=8, values=["右方", "下方"]).grid(row=row, column=1, sticky="w")
+
         row += 1
         ttk.Label(
             self.win,
             text="（分次蓋章才需要設：例如組長先蓋存檔，主任拿到檔案後另外執行本程式，\n"
-                 "　只設定主任自己的章，這裡填「1」讓主任的章自動往內讓開一格，\n"
-                 "　不會跟組長已經蓋好、但這次看不到的章重疊。同一次批次一起蓋則留 0。）",
+                 "　只設定主任自己的章，這裡填「1」讓主任的章自動排在組長章的右方或\n"
+                 "　下方，不會跟組長已經蓋好、但這次看不到的章重疊。同一次批次一起蓋\n"
+                 "　則留 0。）",
             foreground="#777", justify="left").grid(
             row=row, column=0, columnspan=3, sticky="w", padx=10)
 
@@ -1123,6 +1378,7 @@ class AddStampDialog:
             "name": self.name.get().strip(),
             "width_pct": self.width_pct.get(),
             "offset_index": self.offset_index.get(),
+            "stack_direction": "down" if self.stack_direction_label.get() == "下方" else "right",
             "position": ("custom" if self.use_custom_pos.get() else
                          POSITION_LABEL_TO_CODE.get(self.position_label.get(), DEFAULT_POSITION)),
             "custom_x_pct": self.custom_x_pct.get(),
@@ -1136,7 +1392,7 @@ class StampApp:
     def __init__(self, root):
         self.root = root
         root.title("批次自動蓋章工具")
-        root.geometry("700x760")
+        root.geometry("720x860")
         root.resizable(False, False)
 
         pad = {"padx": 10, "pady": 6}
@@ -1152,6 +1408,8 @@ class StampApp:
         self.suffix_custom = tk.StringVar(
             value=settings.get("suffix_custom", "已蓋章"))
         self.add_timestamp = tk.BooleanVar(value=settings.get("add_timestamp", False))
+        self.timestamp_text = tk.StringVar(value=settings.get("timestamp_text", ""))
+        self.extend_blank = tk.BooleanVar(value=settings.get("extend_blank", False))
         self.custom_font_path = tk.StringVar(value=settings.get("custom_font_path", ""))
         self.stamp_entries = settings.get("stamp_entries", [])
 
@@ -1209,42 +1467,57 @@ class StampApp:
         ts_frm = ttk.Frame(frm)
         ts_frm.grid(row=8, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0))
         ttk.Checkbutton(
-            ts_frm, text="⑥ 每個章的正下方印上時間（格式：月/日 時:分，例如 09/10 14:35）",
+            ts_frm, text="⑥ 每個章的正下方印上時間（民國年/月/日 時:分，例如 115/09/26 14:35）",
             variable=self.add_timestamp).pack(side="left")
 
-        # ⑦ 原始檔搬移
-        ttk.Label(frm, text="⑦ 已核章的原始檔搬到（留空則不搬移）：").grid(
-            row=9, column=0, sticky="w", padx=10, pady=(10, 0))
-        ttk.Entry(frm, textvariable=self.processed_dir, width=58).grid(
-            row=10, column=0, sticky="w", padx=10)
-        ttk.Button(frm, text="選擇資料夾", command=self.choose_processed_dir).grid(
-            row=10, column=1, padx=6)
+        ts_custom_frm = ttk.Frame(frm)
+        ts_custom_frm.grid(row=9, column=0, columnspan=2, sticky="w", padx=30, pady=(2, 0))
+        ttk.Label(ts_custom_frm, text="自訂時間文字（留空=自動使用目前時間）：").pack(side="left")
+        ttk.Entry(ts_custom_frm, textvariable=self.timestamp_text, width=20).pack(side="left", padx=4)
 
-        # ⑧ 自訂中文字型
-        ttk.Label(frm, text="⑧ 自訂中文字型檔（用「文字自動產生」章時才需要，留空自動偵測）：").grid(
+        # ⑦ 新增空白區域蓋章
+        extend_frm = ttk.Frame(frm)
+        extend_frm.grid(row=10, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0))
+        ttk.Checkbutton(
+            extend_frm,
+            text="⑦ 在文件最下方新增一塊空白區域蓋章（不佔用原內容、保證不壓字，不需要判斷版面）",
+            variable=self.extend_blank).pack(side="left")
+
+        # ⑧ 原始檔搬移
+        ttk.Label(frm, text="⑧ 已核章的原始檔搬到（留空則不搬移）：").grid(
             row=11, column=0, sticky="w", padx=10, pady=(10, 0))
-        ttk.Entry(frm, textvariable=self.custom_font_path, width=58).grid(
+        ttk.Entry(frm, textvariable=self.processed_dir, width=58).grid(
             row=12, column=0, sticky="w", padx=10)
-        ttk.Button(frm, text="選擇字型檔", command=self.choose_font).grid(
+        ttk.Button(frm, text="選擇資料夾", command=self.choose_processed_dir).grid(
             row=12, column=1, padx=6)
+
+        # ⑨ 自訂中文字型
+        ttk.Label(frm, text="⑨ 自訂中文字型檔（用「文字自動產生」章時才需要，留空自動偵測）：").grid(
+            row=13, column=0, sticky="w", padx=10, pady=(10, 0))
+        ttk.Entry(frm, textvariable=self.custom_font_path, width=58).grid(
+            row=14, column=0, sticky="w", padx=10)
+        ttk.Button(frm, text="選擇字型檔", command=self.choose_font).grid(
+            row=14, column=1, padx=6)
 
         note = ("說明：\n"
                 "・PDF 只會蓋在「最後一頁」；圖片檔會蓋在整張圖片上。\n"
                 "・如果有兩個章選了同一個位置，程式會自動把它們排成一排，不會疊在一起。\n"
                 "・「固定位置」會直接貼齊邊緣；「智慧偵測」在單一章時會找附近最空白處，\n"
                 "  多章共用同位置時會自動改用固定排列。\n"
+                "・勾選⑦後，位置設定只會決定靠左/置中/靠右，蓋在新加的空白區域裡，\n"
+                "  不會再判斷版面內容。\n"
                 "・原始檔本身內容不會被修改，設定內容下次開啟會自動記住。")
         ttk.Label(frm, text=note, foreground="#555").grid(
-            row=13, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 0))
+            row=15, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 0))
 
         self.start_btn = ttk.Button(frm, text="開始批次蓋章", command=self.start)
-        self.start_btn.grid(row=14, column=0, columnspan=2, pady=10)
+        self.start_btn.grid(row=16, column=0, columnspan=2, pady=10)
 
         self.progress = ttk.Progressbar(frm, length=640, mode="determinate")
-        self.progress.grid(row=15, column=0, columnspan=2, padx=10)
+        self.progress.grid(row=17, column=0, columnspan=2, padx=10)
 
         self.log_box = tk.Text(frm, height=8, width=82, state="disabled", bg="#f7f7f7")
-        self.log_box.grid(row=16, column=0, columnspan=2, padx=10, pady=10)
+        self.log_box.grid(row=18, column=0, columnspan=2, padx=10, pady=10)
 
         self._refresh_stamp_listbox()
 
@@ -1263,7 +1536,8 @@ class StampApp:
             else:
                 pos = POSITION_CODE_TO_LABEL.get(e.get("position"), "")
             off = e.get("offset_index", 0)
-            off_txt = f"　讓開:{off}格" if off else ""
+            direction_txt = "下方" if e.get("stack_direction") == "down" else "右方"
+            off_txt = f"　讓開:{off}格({direction_txt})" if off else ""
             self.stamp_listbox.insert(
                 "end", f"[{src}] {label}　位置:{pos}　大小:{e.get('width_pct')}%{off_txt}")
 
@@ -1369,6 +1643,8 @@ class StampApp:
         mode_code = MODE_LABEL_TO_CODE.get(self.mode_label.get(), DEFAULT_MODE)
         suffix = self._resolve_suffix()
         add_timestamp = self.add_timestamp.get()
+        timestamp_text = self.timestamp_text.get().strip() or None
+        extend_blank = self.extend_blank.get()
         custom_font_path = self.custom_font_path.get().strip() or None
         stamp_entries = list(self.stamp_entries)
 
@@ -1380,6 +1656,8 @@ class StampApp:
             "suffix_choice": self.suffix_choice.get(),
             "suffix_custom": self.suffix_custom.get(),
             "add_timestamp": add_timestamp,
+            "timestamp_text": self.timestamp_text.get().strip(),
+            "extend_blank": extend_blank,
             "custom_font_path": self.custom_font_path.get().strip(),
             "stamp_entries": stamp_entries,
         })
@@ -1391,6 +1669,8 @@ class StampApp:
                     mode=mode_code,
                     suffix=suffix,
                     add_timestamp=add_timestamp,
+                    timestamp_text=timestamp_text,
+                    extend_blank=extend_blank,
                     processed_dir=processed_dir or None,
                     custom_font_path=custom_font_path,
                     log=self.log,
