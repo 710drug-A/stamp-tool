@@ -223,12 +223,15 @@ def _draw_spaced_text(draw, text, x, y_top, font, fill, extra_gap=0.5, align="ce
     return max_h, total_w
 
 
-def _draw_justified_text(draw, text, x_left, col_w, y_top, font, fill):
+def _draw_justified_text(draw, text, x_left, slot_pitch, slot_count, y_top, font, fill):
     """
-    畫一行文字，讓字元『兩端對齊』撐滿 col_w 這個欄寬（第一個字貼齊左邊、
-    最後一個字貼齊右邊，中間平均分配間距）－－常見於印章職稱欄位的排版。
-    只有一個字時就直接靠左；字數多到自然寬度已經超過欄寬時，改用小間距
-    正常排列（不勉強硬擠出負間距）。
+    畫一行文字，用『固定網格』對齊：網格共有 slot_count 格（例如 3 格），
+    相鄰兩格起始位置的間距是 slot_pitch。第一個字在第 0 格、最後一個字在第
+    slot_count-1 格，中間依字數等分內插。這樣不管這行是 2 個字還是 3 個字，
+    都是用同一套網格位置，才能讓不同行之間真正對齊（如果改用「依每個字實際
+    墨色寬度」計算間距，會因為不同字筆劃疏密不同、墨色寬度略有差異，導致
+    看起來對不齊）。
+    只有一個字時就直接靠左。
     回傳這行文字的高度。
     """
     if not text:
@@ -236,24 +239,19 @@ def _draw_justified_text(draw, text, x_left, col_w, y_top, font, fill):
     infos = []
     for ch in text:
         bbox = draw.textbbox((0, 0), ch, font=font)
-        infos.append((ch, bbox[2] - bbox[0], bbox[1], bbox[3]))
-    max_h = max((b3 - b1) for _, _, b1, b3 in infos)
+        infos.append((ch, bbox[1], bbox[3]))
+    max_h = max((b3 - b1) for _, b1, b3 in infos)
 
-    if len(infos) == 1:
-        ch, w, b1, b3 = infos[0]
+    k = len(infos)
+    if k == 1:
+        ch, b1, b3 = infos[0]
         draw.text((x_left, y_top - b1), ch, font=font, fill=fill)
         return max_h
 
-    total_char_w = sum(w for _, w, _, _ in infos)
-    gap = (col_w - total_char_w) / (len(infos) - 1)
-    min_gap = font.size * 0.08
-    if gap < min_gap:
-        gap = min_gap  # 字數太多、欄寬不夠時，退回小間距正常排列
-
-    cur_x = x_left
-    for ch, w, b1, b3 in infos:
-        draw.text((cur_x, y_top - b1), ch, font=font, fill=fill)
-        cur_x += w + gap
+    for j, (ch, b1, b3) in enumerate(infos):
+        pos_slot = j * (slot_count - 1) / (k - 1)
+        x = x_left + pos_slot * slot_pitch
+        draw.text((x, y_top - b1), ch, font=font, fill=fill)
     return max_h
 
 
@@ -346,6 +344,7 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
     cbbox = draw.textbbox((0, 0), sample_char, font=small_font)
     avg_char_w = cbbox[2] - cbbox[0]
     char_gap = avg_char_w * 0.15
+    slot_pitch = avg_char_w + char_gap  # 相鄰兩個字起始位置的間距
     left_col_w = int(slot_count * avg_char_w + (slot_count - 1) * char_gap)
 
     # 左欄最多只能佔用可用寬度的 55%，避免壓縮到姓名的空間；
@@ -358,6 +357,7 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
         cbbox = draw.textbbox((0, 0), sample_char, font=small_font)
         avg_char_w = cbbox[2] - cbbox[0]
         char_gap = avg_char_w * 0.15
+        slot_pitch = avg_char_w + char_gap
         left_col_w = int(slot_count * avg_char_w + (slot_count - 1) * char_gap)
 
     col_gap = 0  # 左右兩欄中間完全不留間距
@@ -385,7 +385,7 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
     cur_y = inner_top + (avail_h - total_left_h) // 2
 
     for line, lh in zip(lines, heights):
-        _draw_justified_text(draw, line, left_x, left_col_w, cur_y, small_font, fill)
+        _draw_justified_text(draw, line, left_x, slot_pitch, slot_count, cur_y, small_font, fill)
         cur_y += lh + line_gap
 
     # -- 右欄：姓名，盡量撐滿章的高度，在右欄範圍內水平置中 --
@@ -400,10 +400,32 @@ def generate_text_stamp(unit="", title="", name="", custom_font_path=None,
     return img
 
 
+def _bleed_ink_color(rgba):
+    """
+    把印章圖片裡『半透明/全透明像素』的 RGB 值，填成印章本身（不透明部分）的
+    平均顏色。
+
+    為什麼要做：透明區域底下的 RGB 值通常是白色或黑色，縮放或合成時如果檢視器
+    沒有做「依透明度加權」的處理，這些顏色會被混進邊緣——PDF 檢視器常常因此
+    讓邊緣變深、PIL 縮放則常讓邊緣變淺，造成 PDF 與 PNG 看起來顏色不一致。
+    把透明像素的 RGB 也填成印章顏色後，不管誰來縮放/合成，結果都只會是
+    「同樣的紅色 + 不同透明度」，顏色就會一致。
+    """
+    arr = np.array(rgba.convert("RGBA"))
+    alpha = arr[:, :, 3]
+    opaque = alpha >= 200
+    if not opaque.any():
+        return rgba
+    fill = np.round(arr[:, :, :3][opaque].mean(axis=0)).astype(np.uint8)
+    partial = alpha < 255
+    arr[partial, :3] = fill
+    return Image.fromarray(arr, "RGBA")
+
+
 def resolve_stamp_entry(entry, custom_font_path=None):
     """把 GUI 上設定的一筆『章』資料，轉成實際的 RGBA 印章圖片"""
     if entry.get("source") == "text":
-        return generate_text_stamp(
+        img = generate_text_stamp(
             unit=entry.get("unit", ""),
             title=entry.get("title", ""),
             name=entry.get("name", ""),
@@ -413,7 +435,8 @@ def resolve_stamp_entry(entry, custom_font_path=None):
         path = entry.get("image_path", "")
         if not path or not os.path.isfile(path):
             raise FileNotFoundError(f"找不到印章圖片: {path}")
-        return load_stamp_rgba(path)
+        img = load_stamp_rgba(path)
+    return _bleed_ink_color(img)
 
 
 def stamp_entry_label(entry):
@@ -962,6 +985,36 @@ def stamp_image_file(input_path, output_path, stamps,
 # ============================================================
 # 蓋章：PDF（只蓋最後一頁）
 # ============================================================
+def _stamp_png_for_pdf(page, rgba, rect, scale=3):
+    """
+    把章圖片轉成『不透明』的 RGB 圖片再嵌入 PDF，避免各家 PDF 檢視器對
+    「帶透明度圖片」縮放/合成方式不同（有的邊緣會變深、有的變淺），造成
+    PDF 跟 PNG 輸出的章顏色看起來不一致。
+
+    做法：先依章在頁面上的實際大小（放大 scale 倍以保持清晰度）縮放，再壓平在
+    該處頁面的底色上（通常是白色；如果該處底色明顯不是白色，就取該處的中位數
+    顏色當底色）。這跟 PNG/JPG 輸出「直接壓在文件像素上」的效果一致。
+    """
+    tw = max(1, int(round(rect.width * scale)))
+    th = max(1, int(round(rect.height * scale)))
+    resized = rgba.resize((tw, th), Image.LANCZOS)
+
+    bg = (255, 255, 255)
+    try:
+        pm = page.get_pixmap(matrix=fitz.Matrix(1, 1), clip=rect,
+                              colorspace=fitz.csRGB, alpha=False)
+        arr = np.frombuffer(pm.samples, dtype=np.uint8).reshape(pm.height, pm.width, 3)
+        med = tuple(int(v) for v in np.median(arr.reshape(-1, 3), axis=0))
+        if min(med) < 235:  # 底色明顯不是白色，才改用該處實際底色
+            bg = med
+    except Exception:
+        pass
+
+    base = Image.new("RGB", resized.size, bg)
+    base.paste(resized, (0, 0), resized)
+    return base
+
+
 def stamp_pdf_file(input_path, output_path, stamps,
                     mode=DEFAULT_MODE, add_timestamp=False,
                     timestamp_text=None, timestamp_color=TIMESTAMP_DEFAULT_COLOR,
@@ -994,7 +1047,7 @@ def stamp_pdf_file(input_path, output_path, stamps,
                 y_pt = strip_y0 + info["y"]
                 rect = fitz.Rect(x_pt, y_pt, x_pt + w_pt, y_pt + h_pt)
                 tmp_path = output_path + f"._stamp_tmp_{len(tmp_paths)}.png"
-                spec["rgba"].save(tmp_path)
+                _stamp_png_for_pdf(page, spec["rgba"], rect).save(tmp_path)
                 tmp_paths.append(tmp_path)
                 page.insert_image(rect, filename=tmp_path, overlay=True)
 
@@ -1068,7 +1121,7 @@ def stamp_pdf_file(input_path, output_path, stamps,
 
             rect = fitz.Rect(x_pt, y_pt, x_pt + w_pt, y_pt + h_pt)
             tmp_path = output_path + f"._stamp_tmp_{len(tmp_paths)}.png"
-            spec["rgba"].save(tmp_path)
+            _stamp_png_for_pdf(page, spec["rgba"], rect).save(tmp_path)
             tmp_paths.append(tmp_path)
             page.insert_image(rect, filename=tmp_path, overlay=True)
 
