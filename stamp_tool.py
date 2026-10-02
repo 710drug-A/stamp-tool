@@ -29,11 +29,15 @@
 """
 
 import os
+import re
 import sys
 import json
 import shutil
 import threading
 import traceback
+import urllib.request
+import urllib.parse
+import urllib.error
 from datetime import datetime
 from collections import OrderedDict
 
@@ -106,6 +110,73 @@ if getattr(sys, "frozen", False):
 else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(_BASE_DIR, "stamp_tool_settings.json")
+
+# 院內員工資料 API（依實際環境可在介面上修改）
+DEFAULT_API_URL = "http://hq-sso2-nvm/IWS/AJAX/getEmpInfo"
+
+
+def fetch_employee_info(emp_no, api_url=DEFAULT_API_URL, timeout=6):
+    """
+    呼叫院內 API，用員工編號查詢員工資料。
+    回傳整筆資料的 dict（例如 emp_name、emp_birth...）；
+    查不到人或連線失敗時丟出例外，訊息可直接顯示給使用者看。
+    """
+    emp_no = (emp_no or "").strip()
+    if not emp_no:
+        raise ValueError("請輸入員工編號")
+
+    url = api_url.strip() + "?" + urllib.parse.urlencode({"emp_no": emp_no})
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8-sig", errors="replace")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"連線院內 API 失敗：{e.reason}") from e
+    except Exception as e:
+        raise RuntimeError(f"連線院內 API 失敗：{e}") from e
+
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"院內 API 回傳的內容不是預期的 JSON 格式：{e}") from e
+
+    if data.get("status") != "success":
+        raise RuntimeError(data.get("msg") or "查無此員工編號")
+    rows = data.get("rows") or []
+    if not rows:
+        raise RuntimeError("查無此員工編號")
+    row = rows[0]
+    if not (row.get("emp_name") or "").strip():
+        raise RuntimeError("院內 API 沒有回傳姓名")
+    return row
+
+
+def format_minguo_birthdate(text):
+    """
+    把使用者輸入的出生年月日（西元或民國，用 / - . 分隔，或直接輸入 7/8 碼
+    數字）轉成院內 API 慣用的民國年格式：3 碼民國年 + 2 碼月 + 2 碼日
+    （例如 0910911 代表民國 91 年 09 月 11 日）。
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("請輸入出生年月日")
+
+    digits_only = re.sub(r"\D", "", text)
+    parts = re.split(r"[/\-.]", text)
+
+    if len(parts) == 3 and all(p.strip() for p in parts):
+        y, m, d = (int(p) for p in parts)
+    elif len(digits_only) == 8:  # 西元8碼 YYYYMMDD
+        y, m, d = int(digits_only[:4]), int(digits_only[4:6]), int(digits_only[6:8])
+    elif len(digits_only) == 7:  # 民國7碼 YYYMMDD
+        y, m, d = int(digits_only[:3]), int(digits_only[3:5]), int(digits_only[5:7])
+    else:
+        raise ValueError("出生年月日格式看不懂，請用「1990/01/01」或「079/01/01」這樣的格式")
+
+    if y >= 1000:  # 西元年，轉換成民國年
+        y -= 1911
+    if not (1 <= m <= 12 and 1 <= d <= 31):
+        raise ValueError("出生年月日的月份或日期看起來不對，請確認")
+    return f"{y:03d}{m:02d}{d:02d}"
 
 
 def load_settings():
@@ -769,14 +840,22 @@ def layout_stamps_in_strip(strip_w, stamp_specs, ts_reserve=0, log=print):
 
         if down_idxs:
             if row_idxs:
-                ref_x = results[row_idxs[0]]["x"]
+                row_x = results[row_idxs[0]]["x"]
+                row_w = results[row_idxs[0]]["w"]
                 cur_y = row_top + row_h + ts_reserve + gap
             else:
-                ref_x = start_x
+                row_x = start_x
+                row_w = 0
                 cur_y = row_top
             for i in down_idxs:
                 w, h = sized[i]
-                x = min(max(0, ref_x), max(0, strip_w - w))
+                if anchor == "right":
+                    x = row_x + row_w - w  # 跟上面章的右邊緣對齊
+                elif anchor == "left":
+                    x = row_x  # 跟上面章的左邊緣對齊
+                else:  # center / custom：跟上面章的水平中心對齊
+                    x = row_x + row_w // 2 - w // 2
+                x = min(max(0, x), max(0, strip_w - w))
                 results[i] = {"x": x, "y": cur_y, "w": w, "h": h, "score": None}
                 cur_y += h + ts_reserve + gap
 
@@ -1441,11 +1520,130 @@ class AddStampDialog:
         self.win.destroy()
 
 
-class StampApp:
+class VerifyIdentityDialog:
+    """
+    蓋章前的身分驗證視窗：輸入員工編號 + 出生年月日，呼叫院內 API 查詢員工
+    資料，核對查到的姓名跟出生年月日（emp_birth，民國年格式）是否都跟這個
+    章一致，兩項都符合才能蓋章。
+    """
+
+    def __init__(self, parent, stamp_label, expected_name, api_url):
+        self.expected_name = expected_name
+        self.api_url = api_url
+        self.result = None  # 'ok' | 'skip' | 'abort'
+        self.verified_emp_no = None
+        self.verified_birthdate = None
+
+        self.win = tk.Toplevel(parent)
+        self.win.title("蓋章前身分驗證")
+        self.win.resizable(False, False)
+        self.win.transient(parent)
+        self.win.grab_set()
+        self.win.protocol("WM_DELETE_WINDOW", self._on_abort)
+
+        pad = {"padx": 10, "pady": 5}
+
+        ttk.Label(self.win, text=f"即將蓋章：{stamp_label}（章上姓名：{expected_name}）",
+                  font=("", 10, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", **pad)
+
+        self.emp_no = tk.StringVar()
+        self.birthdate = tk.StringVar()
+
+        ttk.Label(self.win, text="員工編號：").grid(row=1, column=0, sticky="w", **pad)
+        self.emp_entry = ttk.Entry(self.win, textvariable=self.emp_no, width=16)
+        self.emp_entry.grid(row=1, column=1, sticky="w")
+
+        ttk.Label(self.win, text="出生年月日（例：1990/01/01）：").grid(
+            row=2, column=0, sticky="w", **pad)
+        ttk.Entry(self.win, textvariable=self.birthdate, width=16).grid(
+            row=2, column=1, sticky="w")
+
+        self.status_label = ttk.Label(self.win, text="", foreground="#555", wraplength=360,
+                                       justify="left")
+        self.status_label.grid(row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 4))
+
+        btn_frm = ttk.Frame(self.win)
+        btn_frm.grid(row=4, column=0, columnspan=3, pady=10)
+        self.verify_btn = ttk.Button(btn_frm, text="查詢並比對", command=self._verify)
+        self.verify_btn.pack(side="left", padx=4)
+        self.confirm_btn = ttk.Button(btn_frm, text="比對成功，蓋這個章",
+                                       command=self._on_confirm, state="disabled")
+        self.confirm_btn.pack(side="left", padx=4)
+        ttk.Button(btn_frm, text="跳過這個章", command=self._on_skip).pack(side="left", padx=4)
+        ttk.Button(btn_frm, text="取消全部", command=self._on_abort).pack(side="left", padx=4)
+
+        self.emp_entry.focus_set()
+
+    def _verify(self):
+        emp_no = self.emp_no.get().strip()
+        birthdate_input = self.birthdate.get().strip()
+        if not emp_no:
+            self.status_label.configure(text="請輸入員工編號", foreground="#c00")
+            return
+        if not birthdate_input:
+            self.status_label.configure(text="請輸入出生年月日", foreground="#c00")
+            return
+
+        try:
+            expected_birth = format_minguo_birthdate(birthdate_input)
+        except ValueError as e:
+            self.status_label.configure(text=str(e), foreground="#c00")
+            return
+
+        self.verify_btn.configure(state="disabled")
+        self.status_label.configure(text="查詢中...", foreground="#555")
+        self.win.update_idletasks()
+
+        try:
+            info = fetch_employee_info(emp_no, self.api_url)
+        except Exception as e:
+            self.status_label.configure(text=f"查詢失敗：{e}", foreground="#c00")
+            self.verify_btn.configure(state="normal")
+            self.confirm_btn.configure(state="disabled")
+            return
+
+        self.verify_btn.configure(state="normal")
+        actual_name = (info.get("emp_name") or "").strip()
+        actual_birth = (info.get("emp_birth") or "").strip()
+
+        name_ok = actual_name == self.expected_name
+        birth_ok = actual_birth == expected_birth
+
+        if name_ok and birth_ok:
+            self.status_label.configure(
+                text=f"✔ 查到「{actual_name}」，姓名與出生年月日都核對相符，可以蓋章。",
+                foreground="#080")
+            self.confirm_btn.configure(state="normal")
+            self.verified_emp_no = emp_no
+            self.verified_birthdate = birthdate_input
+        else:
+            problems = []
+            if not name_ok:
+                problems.append(f"查到姓名「{actual_name}」，跟章上姓名「{self.expected_name}」不一致")
+            if not birth_ok:
+                problems.append("出生年月日不一致")
+            self.status_label.configure(
+                text="✘ " + "；".join(problems) + "，不能蓋這個章。", foreground="#c00")
+            self.confirm_btn.configure(state="disabled")
+
+    def _on_confirm(self):
+        self.result = "ok"
+        self.win.destroy()
+
+    def _on_skip(self):
+        self.result = "skip"
+        self.win.destroy()
+
+    def _on_abort(self):
+        self.result = "abort"
+        self.win.destroy()
+
+
+
     def __init__(self, root):
         self.root = root
         root.title("批次自動蓋章工具")
-        root.geometry("720x860")
+        root.geometry("720x960")
         root.resizable(False, False)
 
         pad = {"padx": 10, "pady": 6}
@@ -1463,6 +1661,8 @@ class StampApp:
         self.add_timestamp = tk.BooleanVar(value=settings.get("add_timestamp", False))
         self.timestamp_text = tk.StringVar(value=settings.get("timestamp_text", ""))
         self.extend_blank = tk.BooleanVar(value=settings.get("extend_blank", False))
+        self.api_verify_enabled = tk.BooleanVar(value=settings.get("api_verify_enabled", False))
+        self.api_url = tk.StringVar(value=settings.get("api_url", DEFAULT_API_URL))
         self.custom_font_path = tk.StringVar(value=settings.get("custom_font_path", ""))
         self.stamp_entries = settings.get("stamp_entries", [])
 
@@ -1496,6 +1696,8 @@ class StampApp:
         btn_col.pack(side="left", padx=6)
         ttk.Button(btn_col, text="新增章", command=self.add_stamp).pack(fill="x", pady=2)
         ttk.Button(btn_col, text="刪除選取", command=self.remove_stamp).pack(fill="x", pady=2)
+        ttk.Button(btn_col, text="上移", command=self.move_stamp_up).pack(fill="x", pady=2)
+        ttk.Button(btn_col, text="下移", command=self.move_stamp_down).pack(fill="x", pady=2)
 
         # ④ 蓋章方式
         mode_frm = ttk.Frame(frm)
@@ -1552,6 +1754,18 @@ class StampApp:
         ttk.Button(frm, text="選擇字型檔", command=self.choose_font).grid(
             row=14, column=1, padx=6)
 
+        # ⑩ 院內 API 身分驗證
+        api_frm = ttk.Frame(frm)
+        api_frm.grid(row=15, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 0))
+        ttk.Checkbutton(
+            api_frm,
+            text="⑩ 按「開始批次蓋章」前，先用院內 API 核對員工編號對應的姓名跟章上姓名是否一致",
+            variable=self.api_verify_enabled).pack(side="left")
+
+        ttk.Label(frm, text="API 網址：").grid(row=16, column=0, sticky="w", padx=10)
+        ttk.Entry(frm, textvariable=self.api_url, width=58).grid(
+            row=17, column=0, sticky="w", padx=10)
+
         note = ("說明：\n"
                 "・PDF 只會蓋在「最後一頁」；圖片檔會蓋在整張圖片上。\n"
                 "・如果有兩個章選了同一個位置，程式會自動把它們排成一排，不會疊在一起。\n"
@@ -1559,18 +1773,20 @@ class StampApp:
                 "  多章共用同位置時會自動改用固定排列。\n"
                 "・勾選⑦後，位置設定只會決定靠左/置中/靠右，蓋在新加的空白區域裡，\n"
                 "  不會再判斷版面內容。\n"
+                "・勾選⑩後，只會核對「文字自動產生」章（有填姓名的章）；圖片章不會核對。\n"
+                "  院內 API 查到的姓名跟出生年月日都要跟章上設定一致，才能蓋這個章。\n"
                 "・原始檔本身內容不會被修改，設定內容下次開啟會自動記住。")
         ttk.Label(frm, text=note, foreground="#555").grid(
-            row=15, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 0))
+            row=18, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 0))
 
         self.start_btn = ttk.Button(frm, text="開始批次蓋章", command=self.start)
-        self.start_btn.grid(row=16, column=0, columnspan=2, pady=10)
+        self.start_btn.grid(row=19, column=0, columnspan=2, pady=10)
 
         self.progress = ttk.Progressbar(frm, length=640, mode="determinate")
-        self.progress.grid(row=17, column=0, columnspan=2, padx=10)
+        self.progress.grid(row=20, column=0, columnspan=2, padx=10)
 
         self.log_box = tk.Text(frm, height=8, width=82, state="disabled", bg="#f7f7f7")
-        self.log_box.grid(row=18, column=0, columnspan=2, padx=10, pady=10)
+        self.log_box.grid(row=21, column=0, columnspan=2, padx=10, pady=10)
 
         self._refresh_stamp_listbox()
 
@@ -1607,6 +1823,26 @@ class StampApp:
         idx = sel[0]
         del self.stamp_entries[idx]
         self._refresh_stamp_listbox()
+
+    def move_stamp_up(self):
+        sel = self.stamp_listbox.curselection()
+        if not sel or sel[0] == 0:
+            return
+        idx = sel[0]
+        self.stamp_entries[idx - 1], self.stamp_entries[idx] = (
+            self.stamp_entries[idx], self.stamp_entries[idx - 1])
+        self._refresh_stamp_listbox()
+        self.stamp_listbox.selection_set(idx - 1)
+
+    def move_stamp_down(self):
+        sel = self.stamp_listbox.curselection()
+        if not sel or sel[0] >= len(self.stamp_entries) - 1:
+            return
+        idx = sel[0]
+        self.stamp_entries[idx + 1], self.stamp_entries[idx] = (
+            self.stamp_entries[idx], self.stamp_entries[idx + 1])
+        self._refresh_stamp_listbox()
+        self.stamp_listbox.selection_set(idx + 1)
 
     # -------- 後綴輸入框啟用/停用 --------
     def _update_suffix_entry_state(self):
@@ -1688,6 +1924,29 @@ class StampApp:
                 messagebox.showerror("錯誤", "「原始檔搬移資料夾」請不要跟輸出資料夾相同")
                 return
 
+        stamp_entries = list(self.stamp_entries)
+        stamp_entries_for_run = stamp_entries
+
+        if self.api_verify_enabled.get():
+            api_url = self.api_url.get().strip() or DEFAULT_API_URL
+            filtered = []
+            for entry in stamp_entries:
+                if entry.get("source") == "text" and entry.get("name"):
+                    label = stamp_entry_label(entry)
+                    dlg = VerifyIdentityDialog(self.root, label, entry.get("name"), api_url)
+                    self.root.wait_window(dlg.win)
+                    if dlg.result == "abort":
+                        return
+                    if dlg.result == "ok":
+                        filtered.append(entry)
+                    # result == "skip"：這次不蓋這個章，但保留在清單裡供下次使用
+                else:
+                    filtered.append(entry)
+            if not filtered:
+                messagebox.showerror("錯誤", "所有章這次都被跳過了，沒有章可以蓋")
+                return
+            stamp_entries_for_run = filtered
+
         self.start_btn.configure(state="disabled")
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
@@ -1699,7 +1958,6 @@ class StampApp:
         timestamp_text = self.timestamp_text.get().strip() or None
         extend_blank = self.extend_blank.get()
         custom_font_path = self.custom_font_path.get().strip() or None
-        stamp_entries = list(self.stamp_entries)
 
         save_settings({
             "input_dir": input_dir,
@@ -1713,12 +1971,14 @@ class StampApp:
             "extend_blank": extend_blank,
             "custom_font_path": self.custom_font_path.get().strip(),
             "stamp_entries": stamp_entries,
+            "api_verify_enabled": self.api_verify_enabled.get(),
+            "api_url": self.api_url.get().strip(),
         })
 
         def worker():
             try:
                 batch_process(
-                    input_dir, stamp_entries, output_dir,
+                    input_dir, stamp_entries_for_run, output_dir,
                     mode=mode_code,
                     suffix=suffix,
                     add_timestamp=add_timestamp,
