@@ -1639,7 +1639,7 @@ class VerifyIdentityDialog:
         self.win.destroy()
 
 
-
+class StampApp:
     def __init__(self, root):
         self.root = root
         root.title("批次自動蓋章工具")
