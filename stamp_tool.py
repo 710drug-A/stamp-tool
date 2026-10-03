@@ -997,10 +997,15 @@ def stamp_image_file(input_path, output_path, stamps,
             resized = spec["rgba"].resize((w, h), Image.LANCZOS)
             img.paste(resized, (x, y), resized)
             if ts_text:
-                font_size = max(14, int(w * 0.16))
+                font_size = max(10, int(w * 0.16))
                 font = get_ascii_font(font_size)
                 bbox = draw.textbbox((0, 0), ts_text, font=font)
                 tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                if tw > w:  # 時間文字不能比章本身還寬，超過就縮小字級
+                    font_size = max(6, int(font_size * (w / tw) * 0.97))
+                    font = get_ascii_font(font_size)
+                    bbox = draw.textbbox((0, 0), ts_text, font=font)
+                    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
                 tx = x + (w - tw) // 2
                 ty = y + h + max(2, int(h * 0.03))
                 tx = max(0, min(tx, W - tw))
@@ -1043,10 +1048,15 @@ def stamp_image_file(input_path, output_path, stamps,
 
         if ts_text:
             draw = ImageDraw.Draw(img)
-            font_size = max(14, int(w * 0.16))
+            font_size = max(10, int(w * 0.16))
             font = get_ascii_font(font_size)
             bbox = draw.textbbox((0, 0), ts_text, font=font)
             tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if tw > w:  # 時間文字不能比章本身還寬，超過就縮小字級
+                font_size = max(6, int(font_size * (w / tw) * 0.97))
+                font = get_ascii_font(font_size)
+                bbox = draw.textbbox((0, 0), ts_text, font=font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
             tx = x + (w - tw) // 2
             ty = y + h + max(2, int(h * 0.03))
             tx = max(0, min(tx, W - tw))
@@ -1131,8 +1141,11 @@ def stamp_pdf_file(input_path, output_path, stamps,
                 page.insert_image(rect, filename=tmp_path, overlay=True)
 
                 if ts_text:
-                    font_size = max(8, min(14, w_pt * 0.15))
+                    font_size = max(6, min(14, w_pt * 0.15))
                     text_w = fitz.get_text_length(ts_text, fontname="helv", fontsize=font_size)
+                    if text_w > w_pt:  # 時間文字不能比章本身還寬，超過就縮小字級
+                        font_size = max(4, font_size * (w_pt / text_w) * 0.97)
+                        text_w = fitz.get_text_length(ts_text, fontname="helv", fontsize=font_size)
                     tx = x_pt + (w_pt - text_w) / 2
                     ty = y_pt + h_pt + font_size * 1.1
                     ty = min(ty, page.rect.height - 2)
@@ -1205,8 +1218,11 @@ def stamp_pdf_file(input_path, output_path, stamps,
             page.insert_image(rect, filename=tmp_path, overlay=True)
 
             if ts_text:
-                font_size = max(8, min(14, w_pt * 0.15))
+                font_size = max(6, min(14, w_pt * 0.15))
                 text_w = fitz.get_text_length(ts_text, fontname="helv", fontsize=font_size)
+                if text_w > w_pt:  # 時間文字不能比章本身還寬，超過就縮小字級
+                    font_size = max(4, font_size * (w_pt / text_w) * 0.97)
+                    text_w = fitz.get_text_length(ts_text, fontname="helv", fontsize=font_size)
                 tx = x_pt + (w_pt - text_w) / 2
                 ty = y_pt + h_pt + font_size * 1.1
                 ty = min(ty, page_rect.height - 2)
@@ -1553,7 +1569,7 @@ class VerifyIdentityDialog:
         self.emp_entry = ttk.Entry(self.win, textvariable=self.emp_no, width=16)
         self.emp_entry.grid(row=1, column=1, sticky="w")
 
-        ttk.Label(self.win, text="出生年月日（例：1990/01/01）：").grid(
+        ttk.Label(self.win, text="出生年月日（例：0120330，民國年3碼+月2碼+日2碼）：").grid(
             row=2, column=0, sticky="w", **pad)
         ttk.Entry(self.win, textvariable=self.birthdate, width=16).grid(
             row=2, column=1, sticky="w")
@@ -1661,7 +1677,6 @@ class StampApp:
         self.add_timestamp = tk.BooleanVar(value=settings.get("add_timestamp", False))
         self.timestamp_text = tk.StringVar(value=settings.get("timestamp_text", ""))
         self.extend_blank = tk.BooleanVar(value=settings.get("extend_blank", False))
-        self.api_verify_enabled = tk.BooleanVar(value=settings.get("api_verify_enabled", False))
         self.api_url = tk.StringVar(value=settings.get("api_url", DEFAULT_API_URL))
         self.custom_font_path = tk.StringVar(value=settings.get("custom_font_path", ""))
         self.stamp_entries = settings.get("stamp_entries", [])
@@ -1754,13 +1769,13 @@ class StampApp:
         ttk.Button(frm, text="選擇字型檔", command=self.choose_font).grid(
             row=14, column=1, padx=6)
 
-        # ⑩ 院內 API 身分驗證
-        api_frm = ttk.Frame(frm)
-        api_frm.grid(row=15, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 0))
-        ttk.Checkbutton(
-            api_frm,
-            text="⑩ 按「開始批次蓋章」前，先用院內 API 核對員工編號對應的姓名跟章上姓名是否一致",
-            variable=self.api_verify_enabled).pack(side="left")
+        # ⑩ 院內 API 身分驗證（必要步驟，不能關閉）
+        ttk.Label(
+            frm,
+            text="⑩ 身分驗證（必要）：每次蓋章前，都會用院內 API 核對員工編號、\n"
+                 "　出生年月日對應的姓名，是否跟章上設定的姓名一致，通過才能蓋章。",
+            foreground="#a00").grid(row=15, column=0, columnspan=2, sticky="w",
+                                     padx=10, pady=(10, 0))
 
         ttk.Label(frm, text="API 網址：").grid(row=16, column=0, sticky="w", padx=10)
         ttk.Entry(frm, textvariable=self.api_url, width=58).grid(
@@ -1773,7 +1788,7 @@ class StampApp:
                 "  多章共用同位置時會自動改用固定排列。\n"
                 "・勾選⑦後，位置設定只會決定靠左/置中/靠右，蓋在新加的空白區域裡，\n"
                 "  不會再判斷版面內容。\n"
-                "・勾選⑩後，只會核對「文字自動產生」章（有填姓名的章）；圖片章不會核對。\n"
+                "・⑩ 身分驗證只會核對「文字自動產生」章（有填姓名的章）；圖片章不會核對。\n"
                 "  院內 API 查到的姓名跟出生年月日都要跟章上設定一致，才能蓋這個章。\n"
                 "・原始檔本身內容不會被修改，設定內容下次開啟會自動記住。")
         ttk.Label(frm, text=note, foreground="#555").grid(
@@ -1925,27 +1940,27 @@ class StampApp:
                 return
 
         stamp_entries = list(self.stamp_entries)
-        stamp_entries_for_run = stamp_entries
 
-        if self.api_verify_enabled.get():
-            api_url = self.api_url.get().strip() or DEFAULT_API_URL
-            filtered = []
-            for entry in stamp_entries:
-                if entry.get("source") == "text" and entry.get("name"):
-                    label = stamp_entry_label(entry)
-                    dlg = VerifyIdentityDialog(self.root, label, entry.get("name"), api_url)
-                    self.root.wait_window(dlg.win)
-                    if dlg.result == "abort":
-                        return
-                    if dlg.result == "ok":
-                        filtered.append(entry)
-                    # result == "skip"：這次不蓋這個章，但保留在清單裡供下次使用
-                else:
+        # 身分驗證是必要步驟，不能關閉：每個「文字自動產生」且有填姓名的章，
+        # 都一定要先通過員工編號＋出生年月日核對，才能蓋這個章
+        api_url = self.api_url.get().strip() or DEFAULT_API_URL
+        filtered = []
+        for entry in stamp_entries:
+            if entry.get("source") == "text" and entry.get("name"):
+                label = stamp_entry_label(entry)
+                dlg = VerifyIdentityDialog(self.root, label, entry.get("name"), api_url)
+                self.root.wait_window(dlg.win)
+                if dlg.result == "abort":
+                    return
+                if dlg.result == "ok":
                     filtered.append(entry)
-            if not filtered:
-                messagebox.showerror("錯誤", "所有章這次都被跳過了，沒有章可以蓋")
-                return
-            stamp_entries_for_run = filtered
+                # result == "skip"：這次不蓋這個章，但保留在清單裡供下次使用
+            else:
+                filtered.append(entry)
+        if not filtered:
+            messagebox.showerror("錯誤", "所有章這次都被跳過了，沒有章可以蓋")
+            return
+        stamp_entries_for_run = filtered
 
         self.start_btn.configure(state="disabled")
         self.log_box.configure(state="normal")
@@ -1971,7 +1986,6 @@ class StampApp:
             "extend_blank": extend_blank,
             "custom_font_path": self.custom_font_path.get().strip(),
             "stamp_entries": stamp_entries,
-            "api_verify_enabled": self.api_verify_enabled.get(),
             "api_url": self.api_url.get().strip(),
         })
 
