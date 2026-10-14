@@ -1677,7 +1677,8 @@ class StampApp:
         self.add_timestamp = tk.BooleanVar(value=settings.get("add_timestamp", False))
         self.timestamp_text = tk.StringVar(value=settings.get("timestamp_text", ""))
         self.extend_blank = tk.BooleanVar(value=settings.get("extend_blank", False))
-        self.api_url = tk.StringVar(value=settings.get("api_url", DEFAULT_API_URL))
+        # API 網址不顯示在介面；仍會記在設定檔，管理者可直接改 json
+        self.api_url = (settings.get("api_url") or DEFAULT_API_URL).strip()
         self.custom_font_path = tk.StringVar(value=settings.get("custom_font_path", ""))
         self.stamp_entries = settings.get("stamp_entries", [])
 
@@ -1776,10 +1777,6 @@ class StampApp:
                  "　出生年月日對應的姓名，是否跟章上設定的姓名一致，通過才能蓋章。",
             foreground="#a00").grid(row=15, column=0, columnspan=2, sticky="w",
                                      padx=10, pady=(10, 0))
-
-        ttk.Label(frm, text="API 網址：").grid(row=16, column=0, sticky="w", padx=10)
-        ttk.Entry(frm, textvariable=self.api_url, width=58).grid(
-            row=17, column=0, sticky="w", padx=10)
 
         note = ("說明：\n"
                 "・PDF 只會蓋在「最後一頁」；圖片檔會蓋在整張圖片上。\n"
@@ -1943,7 +1940,7 @@ class StampApp:
 
         # 身分驗證是必要步驟，不能關閉：每個「文字自動產生」且有填姓名的章，
         # 都一定要先通過員工編號＋出生年月日核對，才能蓋這個章
-        api_url = self.api_url.get().strip() or DEFAULT_API_URL
+        api_url = self.api_url or DEFAULT_API_URL
         filtered = []
         for entry in stamp_entries:
             if entry.get("source") == "text" and entry.get("name"):
@@ -1986,7 +1983,7 @@ class StampApp:
             "extend_blank": extend_blank,
             "custom_font_path": self.custom_font_path.get().strip(),
             "stamp_entries": stamp_entries,
-            "api_url": self.api_url.get().strip(),
+            "api_url": self.api_url,
         })
 
         def worker():
